@@ -463,7 +463,6 @@ def _apply_rope(
 
     x_nope = x[..., :nope_dim]
     x_pe = x[..., nope_dim:]
-
     x_pe = _apply_rotary_pos_emb_bshd(
         x_pe,
         freqs,
@@ -1173,7 +1172,6 @@ class Compressor(nn.Layer):
             assert len(doc_lens) == len(doc_lens_cutoff)
             assert len(doc_lens) == len(doc_starts_cutoff)
 
-            # a // ratio + b // ratio <= (a + b) // ratio
             n_compressed = sq // ratio
             total_cutoff = int(doc_lens_cutoff.sum().item())
             actual_n_compressed = total_cutoff // ratio
@@ -1281,8 +1279,7 @@ class Compressor(nn.Layer):
             kv = self._overlap_transform(kv, fill_value=0)
             score = self._overlap_transform(score, fill_value=float("-inf"))
         # Gated pooling: softmax over the pool_dim, weighted sum.
-        weights = F.softmax(score, axis=2).cast(kv.dtype)
-        kv = (kv * weights).sum(axis=2)  # [b, n_compressed, head_dim]
+        kv = (kv * F.softmax(score, axis=2)).sum(axis=2)
 
         kv = self.norm(kv.cast(x.dtype))
 
@@ -2005,6 +2002,7 @@ class CompressedSparseAttention(FleetLayer):
                         k_indexer_global,
                         query.detach(),
                         key_comp_mla,
+                        None,
                         int(self.compress_ratio),
                         int(loss_topk_effective),
                         float(self.softmax_scale),
