@@ -18,7 +18,7 @@ Compressed Sparse Attention (CSA) for DeepSeekV4 Hybrid Attention.
 Ported from Megatron-LM experimental_attention_variant/csa.py (commit bf4e1db).
 
 Components:
-  - Compressor: Gated pooling compressor with overlap (ratio=4) or non-overlap (ratio=128)
+  - Compressor: learned overlap convolution (ratio=1) or gated compression
   - CSAIndexer: Learned top-k retrieval over compressed positions
   - CompressedSparseAttention: Core attention combining sliding window + compressed KV
 """
@@ -1528,12 +1528,12 @@ class CompressorSublayersSpec:
 
 
 class Compressor(nn.Layer):
-    """Gated pooling compressor for CSA.
+    """Token compressor for CSA.
 
     Compresses a sequence by pooling groups of compress_ratio tokens using
     learned gated weights.
 
-    For ratio=4: overlapping compression (coff=2)
+    For ratio=1: learned overlap convolution (coff=2)
     For ratio=128: non-overlapping compression (coff=1)
     """
 
@@ -1550,9 +1550,10 @@ class Compressor(nn.Layer):
         self.config = config
         self.compress_ratio = compress_ratio
         self.head_dim = head_dim
-        # CSA layers (1 < ratio < 128) use overlapping compression (coff=2);
-        # HCA (ratio 128) and window-only (ratio 0) do not overlap.
-        self.overlap = 1 < compress_ratio < 128
+        # Ratio 1 uses the learned convolution; ratios 2..127 retain the
+        # original overlap transform. Both paths project a/b halves (coff=2).
+        self.use_conv_overlap = compress_ratio == 1
+        self.overlap = 1 <= compress_ratio < 128
         self.coff = 1 + int(self.overlap)
         self.rotate = rotate
         self.qk_pos_emb_head_dim = config.qk_pos_emb_head_dim or 0
@@ -1596,6 +1597,21 @@ class Compressor(nn.Layer):
                 else 0.02
             ),
         )
+        self.conv_kernel = None
+        if self.use_conv_overlap:
+            self.overlap_conv_kernel_size = config.overlap_conv_kernel_size
+            self.conv_kernel = self.create_parameter(
+                shape=[
+                    config.max_seq_length // compress_ratio,
+                    self.overlap_conv_kernel_size,
+                ],
+                dtype="float32",
+                default_initializer=nn.initializer.Normal(
+                    std=config.init_method_std
+                    if hasattr(config, "init_method_std")
+                    else 0.02
+                ),
+            )
         self._cast_to_low_precision = False
 
         self.norm = build_spec_layer(
@@ -1685,6 +1701,106 @@ class Compressor(nn.Layer):
                 )
         return new_tensor
 
+    def _conv_overlap_pool(
+        self,
+        kv: Tensor,
+        score: Tensor,
+        is_first: Tensor | None = None,
+    ) -> Tensor:
+        """Apply the learned overlap convolution and pool compression groups.
+
+        Shape symbols:
+            B: batch size
+            G: number of compressed groups
+            R: compression ratio, required to be 1
+            S: sequence length; because R is 1, ``S == G``
+            D: compressor head dimension
+            K: overlap convolution kernel size
+
+        Args:
+            kv: [B, G, 1, 2D], containing the ``a`` and ``b`` projections.
+            score: [B, G, 1, 2D], gates corresponding to ``kv``.
+            is_first: optional [G] document-start mask.
+
+        Returns:
+            Tensor [B, G, D].
+        """
+        # kv: [B, G, 1, 2D]
+        b, n_groups, ratio, _ = kv.shape
+        if ratio != 1:
+            raise ValueError(
+                "Learned overlap convolution requires compress_ratio=1, "
+                f"got {ratio}."
+            )
+        d = self.head_dim
+        # R == 1, therefore S == G.
+        sq = n_groups * ratio
+        if n_groups > self.conv_kernel.shape[0]:
+            raise ValueError(
+                "Overlap convolution sequence range exceeds conv_kernel: "
+                f"groups={n_groups}, capacity={self.conv_kernel.shape[0]}."
+            )
+        # kv, score: [B, S, 2D]
+        kv = kv.reshape([b, sq, 2 * d])
+        score = score.reshape([b, sq, 2 * d])
+        # Keep the convolutional Hadamard products and accumulation in FP32.
+        # value_a, value_b: [B, S, D], float32
+        value_a = kv[:, :, :d].cast("float32") * score[:, :, :d].cast("float32")
+        value_b = kv[:, :, d:].cast("float32") * score[:, :, d:].cast("float32")
+
+        if is_first is not None:
+            # doc_ids at compressed-group granularity: [G]
+            doc_ids = paddle.cumsum(is_first.cast("int32"), axis=0)
+        else:
+            doc_ids = None
+
+        # One learned kernel row per compressed group: [G, K]
+        kernel = self.conv_kernel[:n_groups]
+        # offsets: [K], equal to [-K/2, ..., K/2 - 1]
+        half = self.overlap_conv_kernel_size // 2
+        offsets = paddle.arange(-half, half, dtype="int64")
+        # Base destination positions: [S, 1]
+        tap_indices = paddle.arange(sq, dtype="int64").reshape([-1, 1])
+        # Source position for every destination and tap: [S, K]
+        tap_indices = tap_indices + offsets.reshape([1, -1])
+        # Sequence-boundary validity mask: [S, K]
+        valid = (tap_indices >= 0) & (tap_indices < sq)
+        # In-range gather indices; invalid entries are zeroed after gather: [S, K]
+        safe_indices = paddle.clip(tap_indices, min=0, max=sq - 1)
+
+        # Flatten for paddle.gather: [S * K]
+        flat_indices = safe_indices.reshape([-1])
+        # All b candidates for every destination/tap: [B, S, K, D]
+        b_windows = paddle.gather(value_b, flat_indices, axis=1).reshape(
+            [b, sq, self.overlap_conv_kernel_size, d]
+        )
+        # All a candidates for every destination/tap: [B, S, K, D]
+        a_windows = paddle.gather(value_a, flat_indices, axis=1).reshape(
+            [b, sq, self.overlap_conv_kernel_size, d]
+        )
+        # Negative-offset taps use b; zero/positive-offset taps use a:
+        # windows: [B, S, K, D]
+        windows = paddle.concat(
+            [b_windows[:, :, :half, :], a_windows[:, :, half:, :]], axis=2
+        )
+
+        if doc_ids is not None:
+            # Document id of each gathered source position: [S, K]
+            source_doc_ids = paddle.gather(doc_ids, flat_indices).reshape(
+                [sq, self.overlap_conv_kernel_size]
+            )
+            # Reject taps whose source and destination belong to different docs: [S, K]
+            valid = valid & (source_doc_ids == doc_ids.reshape([-1, 1]))
+        # Zero sequence-padding and cross-document taps: [B, S, K, D]
+        windows = paddle.where(
+            valid.reshape([1, sq, self.overlap_conv_kernel_size, 1]),
+            windows,
+            paddle.zeros_like(windows),
+        )
+        # Contract K taps independently at every position: [B, S, D]
+        out = paddle.einsum("bskd,sk->bsd", windows, kernel)
+        return out  # [B, G, D], because R == 1 and S == G
+
     def forward(
         self,
         x: Tensor,
@@ -1748,18 +1864,22 @@ class Compressor(nn.Layer):
             ape = ape.cast(score.dtype) if _ACCURACY_COMPATIBLE_KERNEL else ape
             score = score + ape
 
-            if self.overlap:
+            if self.use_conv_overlap:
                 is_first = docmask_meta.compressed_is_first
-                kv = self._overlap_transform(
-                    kv, fill_value=0, is_first=is_first
-                )
-                score = self._overlap_transform(
-                    score, fill_value=float("-inf"), is_first=is_first
-                )
-
-            # TODO: should we cast?
-            # Gated pooling: softmax over the pool_dim, weighted sum.
-            kv = (kv * F.softmax(score, axis=2)).sum(axis=2)
+                kv = self._conv_overlap_pool(kv, score, is_first=is_first)
+            else:
+                if self.overlap:
+                    is_first = docmask_meta.compressed_is_first
+                    kv = self._overlap_transform(
+                        kv, fill_value=0, is_first=is_first
+                    )
+                    score = self._overlap_transform(
+                        score,
+                        fill_value=float("-inf"),
+                        is_first=is_first,
+                    )
+                # Gated pooling: softmax over the pool_dim, weighted sum.
+                kv = (kv * F.softmax(score, axis=2)).sum(axis=2)
             # kv: [b, actual_n_compressed, head_dim]
 
             if self.swa_high_precision_norm:
@@ -1834,17 +1954,13 @@ class Compressor(nn.Layer):
         ape = ape.cast(score.dtype) if _ACCURACY_COMPATIBLE_KERNEL else ape
         score = score + ape
 
-        if self.overlap:
-            kv = self._overlap_transform(kv, fill_value=0)
-            score = self._overlap_transform(score, fill_value=float("-inf"))
-
-        # TODO: old megatron-aligned logic. This will cause possible acc declining
-        # weights = F.softmax(score, axis=2).cast(kv.dtype)
-        # kv = (kv * weights).sum(axis=2)  # [b, n_compressed, head_dim]
-        # Gated pooling: softmax over the pool_dim, weighted sum.
-        kv = (kv * F.softmax(score, axis=2)).sum(
-            axis=2
-        )  # [b, n_compressed, head_dim]
+        if self.use_conv_overlap:
+            kv = self._conv_overlap_pool(kv, score)
+        else:
+            if self.overlap:
+                kv = self._overlap_transform(kv, fill_value=0)
+                score = self._overlap_transform(score, fill_value=float("-inf"))
+            kv = (kv * F.softmax(score, axis=2)).sum(axis=2)
 
         kv = self.norm(kv.cast(x.dtype))
 
@@ -1889,19 +2005,23 @@ class Compressor(nn.Layer):
                 completed group ``g``.
             x_prev: [b, compress_ratio, hidden_size] hidden states of the
                 previous group ``g-1``, or None when ``g == 0``. Only used for
-                the overlapping (ratio==4) path; ignored otherwise.
+                the original overlap path; ignored otherwise.
             group_index: absolute compressed-token index ``g``.
 
         Returns:
             compressed_kv: [b, 1, head_dim].
+
+        Raises:
+            AssertionError: if the learned overlap convolution is enabled.
         """
         b, ratio, _ = x_cur.shape
+        assert not self.use_conv_overlap, (
+            "forward_group does not support the learned overlap convolution"
+        )
         assert ratio == self.compress_ratio, (
             f"forward_group expects a full group of {self.compress_ratio} "
             f"tokens, got {ratio}"
         )
-        d = self.head_dim
-
         kv_cur, _ = self.linear_wkv(x_cur)  # [b, ratio, coff * head_dim]
         score_cur, _ = self.linear_wgate(x_cur)  # [b, ratio, coff * head_dim]
 
@@ -1913,29 +2033,27 @@ class Compressor(nn.Layer):
         score_cur = score_cur + ape
 
         if self.overlap:
-            # Build the single-group overlap tensors [b, 1, 2*ratio, d].
-            # Current group's second half -> positions [ratio:]; previous
-            # group's first half -> positions [:ratio] (fill when g == 0).
-            kv = paddle.full([b, 1, 2 * ratio, d], 0.0, dtype=kv_cur.dtype)
-            score = paddle.full(
-                [b, 1, 2 * ratio, d], float("-inf"), dtype=score_cur.dtype
-            )
-            kv[:, :, ratio:, :] = kv_cur[:, :, :, d:]
-            score[:, :, ratio:, :] = score_cur[:, :, :, d:]
+            kv_groups = [kv_cur]
+            score_groups = [score_cur]
             if x_prev is not None:
                 kv_prev, _ = self.linear_wkv(x_prev)
                 score_prev, _ = self.linear_wgate(x_prev)
                 kv_prev = kv_prev.reshape([b, 1, ratio, -1])
                 score_prev = score_prev.reshape([b, 1, ratio, -1])
                 score_prev = score_prev + ape
-                kv[:, :, :ratio, :] = kv_prev[:, :, :, :d]
-                score[:, :, :ratio, :] = score_prev[:, :, :, :d]
+                kv_groups.insert(0, kv_prev)
+                score_groups.insert(0, score_prev)
+            kv = paddle.concat(kv_groups, axis=1)
+            score = paddle.concat(score_groups, axis=1)
+            kv = self._overlap_transform(kv, fill_value=0)[:, -1:, :, :]
+            score = self._overlap_transform(score, fill_value=float("-inf"))[
+                :, -1:, :, :
+            ]
+            kv = (kv * F.softmax(score, axis=2)).sum(axis=2)
         else:
             kv = kv_cur
             score = score_cur
-
-        # Gated pooling over the pool dim (axis=2), identical to prefill.
-        kv = (kv * F.softmax(score, axis=2)).sum(axis=2)  # [b, 1, head_dim]
+            kv = (kv * F.softmax(score, axis=2)).sum(axis=2)
 
         kv = self.norm(kv.cast(x_cur.dtype))
 
@@ -2160,7 +2278,8 @@ class CompressedSparseAttention(FleetLayer):
     Conditionally builds Compressor and CSAIndexer based on compress_ratio:
       - ratio=-1 (``CSA_MQA_RATIO``): full-causal MQA, no window/compressor
       - ratio=0: window-only attention
-      - ratio=4: window + 4x compressed + learned CSAIndexer
+      - ratio=1: window + learned overlap convolution + CSAIndexer
+      - ratio=2..127: window + original overlap pooling + learned CSAIndexer
       - ratio=128: window + 128x compressed, attend to all compressed positions
     """
 
@@ -2246,8 +2365,8 @@ class CompressedSparseAttention(FleetLayer):
         )
         self._cast_to_low_precision = False
 
-        # Conditionally build Compressor (ratio > 1)
-        if self.compress_ratio > 1:
+        # Conditionally build Compressor (ratio >= 1)
+        if self.compress_ratio >= 1:
             self.compressor = build_spec_layer(
                 sublayers_spec.compressor,
                 config=config,
@@ -2262,7 +2381,7 @@ class CompressedSparseAttention(FleetLayer):
         # Conditionally build Indexer for CSA layers (1 < ratio < 128) and not dense_mode.
         # ratio 128 (HCA) intentionally falls through to the attend-to-all path.
         # Keep this in sync with dsa_attention.py indexer-layer count.
-        if 1 < self.compress_ratio < 128 and not config.csa_dense_mode:
+        if 1 <= self.compress_ratio < 128 and not config.csa_dense_mode:
             self.indexer = build_spec_layer(
                 sublayers_spec.indexer,
                 config=config,
@@ -2723,9 +2842,9 @@ class CompressedSparseAttention(FleetLayer):
                 state.x_cur = None
             return output
 
-        if docmask_meta is not None and self.compress_ratio > 1:
+        if docmask_meta is not None and self.compress_ratio >= 1:
             actual_n_compressed = docmask_meta.actual_n_compressed
-        elif self.compress_ratio > 1:
+        elif self.compress_ratio >= 1:
             actual_n_compressed = sq // self.compress_ratio
         else:
             actual_n_compressed = 0
@@ -2736,7 +2855,7 @@ class CompressedSparseAttention(FleetLayer):
         # Step 2: Compression
         if (
             self.compressor is not None
-            and self.compress_ratio > 1
+            and self.compress_ratio >= 1
             and actual_n_compressed > 0
         ):
             compressed_kv = self.compressor(
@@ -2768,7 +2887,7 @@ class CompressedSparseAttention(FleetLayer):
         tilelang_indexer_loss_state = None
 
         if (
-            self.compress_ratio > 1
+            self.compress_ratio >= 1
             and n_compressed > 0
             and actual_n_compressed > 0
         ):
@@ -2870,7 +2989,7 @@ class CompressedSparseAttention(FleetLayer):
             state.idx_compressed_k = None
             # No group has closed yet; the whole prefix is the open group.
             state.x_cur = (
-                x if (self.compressor is not None and ratio > 1) else None
+                x if (self.compressor is not None and ratio >= 1) else None
             )
 
     def _forward_decode(
@@ -2898,7 +3017,7 @@ class CompressedSparseAttention(FleetLayer):
         t = state.raw_kv.shape[1] - 1
 
         # 2. Accumulate hidden states; emit compressed token when a group closes.
-        if self.compressor is not None and ratio > 1:
+        if self.compressor is not None and ratio >= 1:
             state.append_x(x)
             if state.x_cur.shape[1] == ratio:
                 g = t // ratio  # absolute compressed-token index
@@ -2930,7 +3049,7 @@ class CompressedSparseAttention(FleetLayer):
             window_idxs = get_window_topk_idxs_decode(self.window_size, b, t)
 
             # 5. Compressed indices.
-            if ratio > 1 and n_comp > 0:
+            if ratio >= 1 and n_comp > 0:
                 if self.indexer is not None:
                     compress_idxs = (
                         self._compute_indexer_compressed_topk_idxs_decode(
@@ -3042,7 +3161,7 @@ class CompressedSparseAttention(FleetLayer):
         n_compressed_local = 0
         if (
             self.compressor is not None
-            and self.compress_ratio > 1
+            and self.compress_ratio >= 1
             and sq >= self.compress_ratio
         ):
             assert sq % self.compress_ratio == 0, (
@@ -3052,9 +3171,9 @@ class CompressedSparseAttention(FleetLayer):
         n_compressed_global = n_compressed_local * self.cp_size
 
         # Compute actual_n_compressed accounting for document boundaries
-        if docmask_meta is not None and self.compress_ratio > 1:
+        if docmask_meta is not None and self.compress_ratio >= 1:
             actual_n_compressed = docmask_meta.actual_n_compressed
-        elif self.compress_ratio > 1:
+        elif self.compress_ratio >= 1:
             actual_n_compressed = n_compressed_global
         else:
             actual_n_compressed = 0
@@ -3063,7 +3182,7 @@ class CompressedSparseAttention(FleetLayer):
 
         if (
             self.compressor is not None
-            and self.compress_ratio > 1
+            and self.compress_ratio >= 1
             and n_compressed_local > 0
             and actual_n_compressed > 0
         ):
@@ -3082,7 +3201,7 @@ class CompressedSparseAttention(FleetLayer):
         tilelang_indexer_loss_state = None
 
         if (
-            self.compress_ratio > 1
+            self.compress_ratio >= 1
             and n_compressed_global > 0
             and actual_n_compressed > 0
         ):

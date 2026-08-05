@@ -1256,7 +1256,7 @@ class DSAIndexerLossLoggingHelper:
             # CSA layers (1 < ratio < 128) run the Lightning Indexer; keep this in
             # sync with CompressedSparseAttention.__init__ in csa_attention.py.
             num_indexer_layers = sum(
-                1 for ratio in csa_compress_ratios if 1 < ratio < 128
+                1 for ratio in csa_compress_ratios if 1 <= ratio < 128
             )
         else:
             num_indexer_layers = indexer_loss_values.shape[0]

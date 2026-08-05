@@ -82,6 +82,7 @@ from paddlefleet.tensor_parallel.random import model_parallel_cuda_manual_seed
 from paddlefleet.transformer.csa_attention import (
     CompressedSparseAttention,
     CompressedSparseAttentionSublayersSpec,
+    Compressor,
     CSADocMaskMetadata,
     _apply_rope,
     _build_compressed_causal_mask,
@@ -110,6 +111,96 @@ _SEED = 42
 # tests, so ``min(index_topk, n_compressed)`` always selects every valid block
 # and no tie-break at the top-k boundary can occur.
 _SATURATING_TOPK = 4096
+
+
+class TestCompressorConvOverlap(unittest.TestCase):
+    def test_forward_group_is_not_supported(self):
+        fake = type("FakeCompressor", (), {"use_conv_overlap": True})()
+        x_cur = paddle.zeros([1, 1, 1], dtype="float32")
+        with self.assertRaisesRegex(
+            AssertionError, "does not support the learned overlap convolution"
+        ):
+            Compressor.forward_group(fake, x_cur, None, 0)
+
+    def test_kernel_size_validation(self):
+        for invalid in (0, 3, -2, True):
+            with (
+                self.subTest(invalid=invalid),
+                self.assertRaisesRegex(ValueError, "overlap_conv_kernel_size"),
+            ):
+                _make_config(overlap_conv_kernel_size=invalid)
+
+        with self.assertRaisesRegex(
+            ValueError, "must be set when csa_compress_ratios contains 1"
+        ):
+            _make_config(num_layers=1, csa_compress_ratios=[1])
+
+        with self.assertRaisesRegex(
+            ValueError, "may only be set when csa_compress_ratios contains 1"
+        ):
+            _make_config(overlap_conv_kernel_size=4)
+
+        with self.assertRaisesRegex(
+            ValueError, "does not support context parallelism"
+        ):
+            _make_config(
+                num_layers=1,
+                csa_compress_ratios=[1],
+                overlap_conv_kernel_size=4,
+                context_parallel_size=2,
+            )
+
+        with self.assertRaisesRegex(
+            ValueError, "does not support context parallelism"
+        ):
+            _make_config(
+                overlap_conv_kernel_size=4,
+                context_parallel_size=2,
+            )
+
+    def _run(self, value_a, value_b, kernel, is_first=None):
+        ratio = 1
+        n_groups = len(value_a) // ratio
+        fake = type("FakeCompressor", (), {})()
+        fake.head_dim = 1
+        fake.overlap_conv_kernel_size = kernel.shape[1]
+        fake.conv_kernel = paddle.to_tensor(kernel, dtype="float32")
+        kv = paddle.to_tensor(
+            np.stack([value_a, value_b], axis=-1), dtype="float32"
+        ).reshape([1, n_groups, ratio, 2])
+        score = paddle.ones_like(kv)
+        if is_first is not None:
+            is_first = paddle.to_tensor(is_first, dtype="bool")
+        return Compressor._conv_overlap_pool(fake, kv, score, is_first)
+
+    def test_exact_four_tap_formula(self):
+        a = np.arange(1, 9, dtype="float32")
+        b = np.arange(11, 19, dtype="float32")
+        kernel = np.arange(1, 33, dtype="float32").reshape([8, 4])
+        per_token = np.zeros(8, dtype="float32")
+        for i in range(8):
+            taps = [
+                b[i - 2] if i >= 2 else 0,
+                b[i - 1] if i >= 1 else 0,
+                a[i],
+                a[i + 1] if i + 1 < 8 else 0,
+            ]
+            per_token[i] = np.dot(kernel[i], taps)
+        expected = per_token
+        np.testing.assert_allclose(self._run(a, b, kernel).numpy()[0], expected)
+
+    def test_document_boundary_taps_are_zero(self):
+        a = np.ones(8, dtype="float32")
+        b = np.ones(8, dtype="float32")
+        kernel = np.ones([8, 4], dtype="float32")
+        result = self._run(
+            a,
+            b,
+            kernel,
+            is_first=[True, False, False, False, True, False, False, False],
+        ).numpy()[0]
+        # Each four-token document is evaluated independently.
+        np.testing.assert_array_equal(result[:4], result[4:])
 
 
 class _FakeGroup:
@@ -174,6 +265,7 @@ def _make_config(
     hybrid_index_n_heads=4,
     hybrid_index_head_dim=128,
     hybrid_index_topk=8,
+    overlap_conv_kernel_size=None,
 ):
     if csa_compress_ratios is None:
         csa_compress_ratios = [0, 4, 128, 4]
@@ -213,6 +305,7 @@ def _make_config(
         use_qk_norm=True,
         csa_compress_ratios=csa_compress_ratios,
         csa_window_size=csa_window_size,
+        overlap_conv_kernel_size=overlap_conv_kernel_size,
         dsa_index_n_heads=dsa_index_n_heads,
         dsa_index_head_dim=dsa_index_head_dim,
         dsa_index_topk=dsa_index_topk,
@@ -393,9 +486,13 @@ class TestDSv4HybridConfigAndSpec(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must equal num_hidden_layers"):
             _make_config(num_layers=2, csa_compress_ratios=[0])
 
-        # ratio 1 is ambiguous (no compression yet not window) and rejected.
-        with self.assertRaisesRegex(ValueError, "is invalid"):
-            _make_config(num_layers=1, csa_compress_ratios=[1])
+        # Ratio 1 is the learned overlap-convolution mode.
+        cfg = _make_config(
+            num_layers=1,
+            csa_compress_ratios=[1],
+            overlap_conv_kernel_size=4,
+        )
+        self.assertEqual(cfg.csa_compress_ratios, [1])
 
         # ratio 129 is above HCA (128) and rejected.
         with self.assertRaisesRegex(ValueError, "is invalid"):
@@ -1520,10 +1617,12 @@ class TestDSv4HybridAttentionConstructor(unittest.TestCase):
                 attn = _build_attention(config, layer_number=0)
                 attn.eval()
 
-                # Every CSA layer must build a compressor with overlap (coff=2)
-                # and a Lightning Indexer.
+                # Ratios above 1 retain the original overlap transform.
                 self.assertIsNotNone(attn.core_attention.compressor)
                 self.assertTrue(attn.core_attention.compressor.overlap)
+                self.assertFalse(
+                    attn.core_attention.compressor.use_conv_overlap
+                )
                 self.assertEqual(attn.core_attention.compressor.coff, 2)
                 self.assertIsNotNone(attn.core_attention.indexer)
 
@@ -1568,19 +1667,30 @@ class TestDSv4HybridAttentionConstructor(unittest.TestCase):
         self.assertEqual(num_indexer, 3)
 
     def test_csa_ratio_boundaries(self):
-        # ratio 127 (the upper CSA boundary) builds a CSA layer with overlap
-        # and a Lightning Indexer.
+        # Ratio 127 retains the original overlap transform and an indexer.
         paddle.seed(_SEED)
         config = _make_config(num_layers=1, csa_compress_ratios=[127])
         attn = _build_attention(config, layer_number=0)
         attn.eval()
         self.assertIsNotNone(attn.core_attention.compressor)
         self.assertTrue(attn.core_attention.compressor.overlap)
+        self.assertFalse(attn.core_attention.compressor.use_conv_overlap)
         self.assertIsNotNone(attn.core_attention.indexer)
 
-        # ratio 1 is ambiguous (no compression yet not window) -> rejected.
-        with self.assertRaisesRegex(ValueError, "is invalid"):
-            _make_config(num_layers=1, csa_compress_ratios=[1])
+        # Ratio 1 builds the learned overlap-convolution compressor.
+        config = _make_config(
+            num_layers=1,
+            csa_compress_ratios=[1],
+            overlap_conv_kernel_size=4,
+        )
+        config.max_seq_length = 4096
+        attn = _build_attention(config, layer_number=0)
+        self.assertTrue(attn.core_attention.compressor.overlap)
+        self.assertTrue(attn.core_attention.compressor.use_conv_overlap)
+        self.assertEqual(
+            list(attn.core_attention.compressor.conv_kernel.shape),
+            [config.max_seq_length, config.overlap_conv_kernel_size],
+        )
 
         # ratio 129 is above HCA (128) -> rejected.
         with self.assertRaisesRegex(ValueError, "is invalid"):

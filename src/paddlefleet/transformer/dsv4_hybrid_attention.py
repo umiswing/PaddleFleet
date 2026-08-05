@@ -619,7 +619,7 @@ class DSv4HybridAttention(Attention):
         assert compress_ratio != -2, (
             "DSv4HybridAttention should not be constructed for MLA ratio -2"
         )
-        if compress_ratio not in {-1, 0, 128} and not 2 <= compress_ratio < 128:
+        if compress_ratio not in {-1, 0, 128} and not 1 <= compress_ratio < 128:
             raise ValueError(
                 f"DSv4 hybrid attention requires HCA/CSA/window ratio, got {compress_ratio}"
             )
