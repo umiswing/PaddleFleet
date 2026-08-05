@@ -1046,19 +1046,28 @@ class TransformerConfig(ModelParallelConfig):
     Each query attends to the last csa_window_size tokens via a sliding window.
     """
 
+    overlap_conv_kernel_size: int | None = None
+    """Kernel width of the CSA compressor's learned overlap convolution.
+
+    Must be set to a positive even integer if and only if at least one layer
+    has ``compress_ratio == 1``. Half of the taps read preceding ``b`` entries
+    and half read the current/following ``a`` entries. This mode currently
+    requires ``context_parallel_size == 1``.
+    """
+
     csa_compress_ratios: list | None = None
     """Per-layer attention-kind assignment for the DSv4 hybrid attention stack.
     Length must equal num_hidden_layers (+ mtp_num_layers if present).
     Each entry encodes the layer kind via its integer ratio value:
       - 0: window-only attention (no compression)
-      - 2..127: CSA layer — overlapping compression (coff=2) with learned
+      - 1: CSA layer using the learned overlap convolution without downsampling
+      - 2..127: CSA layer using the original overlap transform with learned
         Lightning Indexer. The compression rate is a free parameter of CSA;
         any integer in [2, 127] is accepted (e.g. 4, 8, 16, ...), including
         non-power-of-2 values such as 3 or 6. The overlap pooling window
         becomes 2 * ratio tokens.
       - 128: HCA layer — non-overlapping compression, attend to all
         compressed positions
-    Value 1 is rejected (ambiguous: no compression yet not window).
     """
 
     csa_compress_rotary_base: float = 40000.0
@@ -1067,7 +1076,7 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     csa_dense_mode: bool = False
-    """If True, skip CSAIndexer for CSA layers (1 < ratio < 128) and attend to all
+    """If True, skip CSAIndexer for CSA layers (1 <= ratio < 128) and attend to all
     compressed positions.
     """
 
@@ -1200,6 +1209,7 @@ class TransformerConfig(ModelParallelConfig):
         "indexer_rope_interleave": "dsa_indexer_rotary_interleaved",
         # CSA / DSv4 Hybrid field mapping
         "csa_window_size": "csa_window_size",
+        "overlap_conv_kernel_size": "overlap_conv_kernel_size",
         "csa_compress_ratios": "csa_compress_ratios",
         "csa_compress_rotary_base": "csa_compress_rotary_base",
         "csa_dense_mode": "csa_dense_mode",
@@ -1475,10 +1485,45 @@ class TransformerConfig(ModelParallelConfig):
 
         # DSv4 Hybrid Attention validation
         if self.experimental_attention_variant == "dsv4_hybrid":
+            if self.overlap_conv_kernel_size is not None and (
+                not isinstance(self.overlap_conv_kernel_size, int)
+                or isinstance(self.overlap_conv_kernel_size, bool)
+                or self.overlap_conv_kernel_size <= 0
+                or self.overlap_conv_kernel_size % 2 != 0
+            ):
+                raise ValueError(
+                    "overlap_conv_kernel_size must be a positive even integer, "
+                    f"got {self.overlap_conv_kernel_size}."
+                )
             if self.csa_compress_ratios is None:
                 raise ValueError(
                     "experimental_attention_variant='dsv4_hybrid' requires "
                     "csa_compress_ratios to be set."
+                )
+            if (
+                1 in self.csa_compress_ratios
+                and self.overlap_conv_kernel_size is None
+            ):
+                raise ValueError(
+                    "overlap_conv_kernel_size must be set when "
+                    "csa_compress_ratios contains 1."
+                )
+            if (
+                1 in self.csa_compress_ratios
+                or self.overlap_conv_kernel_size is not None
+            ) and self.context_parallel_size != 1:
+                raise ValueError(
+                    "compress_ratio=1 overlap convolution does not support "
+                    "context parallelism; context_parallel_size must be 1, "
+                    f"got {self.context_parallel_size}."
+                )
+            if (
+                self.overlap_conv_kernel_size is not None
+                and 1 not in self.csa_compress_ratios
+            ):
+                raise ValueError(
+                    "overlap_conv_kernel_size may only be set when "
+                    "csa_compress_ratios contains 1."
                 )
             mtp_num_layers = (
                 self.mtp_num_layers or self.num_nextn_predict_layers
@@ -1509,11 +1554,11 @@ class TransformerConfig(ModelParallelConfig):
                 is_integral = hasattr(r, "__index__") and type(
                     r
                 ).__name__ not in ("bool", "bool_")
-                if not (is_integral and (r in (-2, -1, 0) or 2 <= r <= 128)):
+                if not (is_integral and (r in (-2, -1, 0) or 1 <= r <= 128)):
                     raise ValueError(
                         f"csa_compress_ratios[{i}]={r} is invalid. "
                         f"Each value must be -2 (MLA), -1 (full-causal MQA), "
-                        f"0 (window), an integer in [2, 127] "
+                        f"0 (window), 1 (overlap convolution), an integer in [2, 127] "
                         f"(CSA, overlap + Lightning Indexer), or 128 (HCA)."
                     )
             if -2 in self.csa_compress_ratios:
@@ -1639,11 +1684,11 @@ class TransformerConfig(ModelParallelConfig):
                         "Indexer receives no training signal."
                     )
                 if not any(
-                    1 < int(ratio) < 128 for ratio in self.csa_compress_ratios
+                    1 <= int(ratio) < 128 for ratio in self.csa_compress_ratios
                 ):
                     raise ValueError(
                         "csa_train_indexer_only=True requires at least one CSA layer "
-                        "with 1 < csa_compress_ratios[i] < 128, got "
+                        "with 1 <= csa_compress_ratios[i] < 128, got "
                         f"{self.csa_compress_ratios}."
                     )
                 if getattr(self, "enable_hy_sparse_attention", False):

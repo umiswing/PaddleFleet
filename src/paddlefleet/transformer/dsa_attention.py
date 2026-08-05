@@ -1285,7 +1285,7 @@ class DSAIndexerLossLoggingHelper:
             # CSA layers (1 < ratio < 128) run the Lightning Indexer; keep this in
             # sync with CompressedSparseAttention.__init__ in csa_attention.py.
             num_indexer_layers = sum(
-                1 for ratio in csa_compress_ratios if 1 < ratio < 128
+                1 for ratio in csa_compress_ratios if 1 <= ratio < 128
             )
             if non_absorbed_mqa:
                 # Hybrid MLA entries (-2) carry their own token-level indexer.
