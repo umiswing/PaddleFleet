@@ -18,7 +18,7 @@ Compressed Sparse Attention (CSA) for DeepSeekV4 Hybrid Attention.
 Ported from Megatron-LM experimental_attention_variant/csa.py (commit bf4e1db).
 
 Components:
-  - Compressor: learned overlap convolution (ratio=1) or gated compression
+  - Compressor: overlapping softmax pooling (ratio=1, sliding window) or gated compression
   - CSAIndexer: Learned top-k retrieval over compressed positions
   - CompressedSparseAttention: Core attention combining sliding window + compressed KV
 """
@@ -1473,7 +1473,7 @@ class Compressor(nn.Layer):
     Compresses a sequence by pooling groups of compress_ratio tokens using
     learned gated weights.
 
-    For ratio=1: learned overlap convolution (coff=2)
+    For ratio=1: overlapping softmax pooling over a sliding window (coff=2)
     For ratio=128: non-overlapping compression (coff=1)
     """
 
@@ -1490,8 +1490,9 @@ class Compressor(nn.Layer):
         self.config = config
         self.compress_ratio = compress_ratio
         self.head_dim = head_dim
-        # Ratio 1 uses the learned convolution; ratios 2..127 retain the
-        # original overlap transform. Both paths project a/b halves (coff=2).
+        # Ratio 1 uses overlapping softmax pooling over a sliding window;
+        # ratios 2..127 retain the original overlap transform. Both paths
+        # project a/b halves (coff=2).
         self.use_conv_overlap = compress_ratio == 1
         self.overlap = 1 <= compress_ratio < 128
         self.coff = 1 + int(self.overlap)
@@ -1535,21 +1536,11 @@ class Compressor(nn.Layer):
                 else 0.02
             ),
         )
-        self.conv_kernel = None
+        # Ratio 1 pools over a sliding overlap window (no downsampling);
+        # its width is the (even) overlap window size. Ratios 2..127 keep the
+        # original overlap transform. Both paths project a/b halves (coff=2).
         if self.use_conv_overlap:
-            self.overlap_conv_kernel_size = config.overlap_conv_kernel_size
-            self.conv_kernel = self.create_parameter(
-                shape=[
-                    config.max_seq_length // compress_ratio,
-                    self.overlap_conv_kernel_size,
-                ],
-                dtype="float32",
-                default_initializer=nn.initializer.Normal(
-                    std=config.init_method_std
-                    if hasattr(config, "init_method_std")
-                    else 0.02
-                ),
-            )
+            self.csa_overlap_window_size = config.csa_overlap_window_size
         self._cast_to_low_precision = False
 
         self.norm = build_spec_layer(
@@ -1639,13 +1630,34 @@ class Compressor(nn.Layer):
                 )
         return new_tensor
 
-    def _conv_overlap_pool(
+    def _overlap_window_pool(
         self,
         kv: Tensor,
         score: Tensor,
         is_first: Tensor | None = None,
     ) -> Tensor:
-        """Apply the learned overlap convolution and pool compression groups.
+        """Overlapping softmax pooling over a sliding window (compress_ratio=1).
+
+        Implements the DSv4 compressor pooling (paper Eq. 11-12) at stride 1,
+        i.e. without downsampling the sequence. For every output position ``i``
+        the pooling window gathers ``K = csa_overlap_window_size`` taps over a
+        fully causal window ``[i-(K-1), ..., i]``: the first ``K/2`` taps read
+        the preceding ``b`` projections ``b[i-(K-1)], ..., b[i-K/2]`` and the
+        remaining ``K/2`` taps read the current/preceding ``a`` projections
+        ``a[i-K/2+1], ..., a[i]``. For the ``K=4`` example in the task this is::
+
+            out[i] = h(kv_b[i-3], s_b[i-3]) + h(kv_b[i-2], s_b[i-2])
+                   + h(kv_a[i-1], s_a[i-1]) + h(kv_a[i],   s_a[i])
+
+        where ``h`` is the Hadamard product and ``s`` are the softmax weights
+        computed jointly over the whole window (per channel):
+
+            out[i] = sum_k softmax(score_window)[k] * kv_window[k].
+
+        Following the paper, taps that fall outside the sequence or cross a
+        document boundary are padded with score ``-inf`` (zero softmax weight)
+        and kv ``0``. The current-position ``a`` tap (offset 0) is always valid,
+        so the softmax denominator is never degenerate.
 
         Shape symbols:
             B: batch size
@@ -1653,7 +1665,7 @@ class Compressor(nn.Layer):
             R: compression ratio, required to be 1
             S: sequence length; because R is 1, ``S == G``
             D: compressor head dimension
-            K: overlap convolution kernel size
+            K: overlap window size (``csa_overlap_window_size``)
 
         Args:
             kv: [B, G, 1, 2D], containing the ``a`` and ``b`` projections.
@@ -1667,76 +1679,83 @@ class Compressor(nn.Layer):
         b, n_groups, ratio, _ = kv.shape
         if ratio != 1:
             raise ValueError(
-                "Learned overlap convolution requires compress_ratio=1, "
+                "Overlap window pooling requires compress_ratio=1, "
                 f"got {ratio}."
             )
         d = self.head_dim
         # R == 1, therefore S == G.
-        sq = n_groups * ratio
-        if n_groups > self.conv_kernel.shape[0]:
-            raise ValueError(
-                "Overlap convolution sequence range exceeds conv_kernel: "
-                f"groups={n_groups}, capacity={self.conv_kernel.shape[0]}."
-            )
-        # kv, score: [B, S, 2D]
+        sq = n_groups
+        k = self.csa_overlap_window_size
+        half = k // 2
+
+        # kv, score: [B, S, 2D]; a-half is [:D], b-half is [D:].
+        # Pool in FP32 for a numerically stable softmax.
         kv = kv.reshape([b, sq, 2 * d])
         score = score.reshape([b, sq, 2 * d])
-        # Keep the convolutional Hadamard products and accumulation in FP32.
-        # value_a, value_b: [B, S, D], float32
-        value_a = kv[:, :, :d].cast("float32") * score[:, :, :d].cast("float32")
-        value_b = kv[:, :, d:].cast("float32") * score[:, :, d:].cast("float32")
+        kv_a = kv[:, :, :d].cast("float32")
+        kv_b = kv[:, :, d:].cast("float32")
+        score_a = score[:, :, :d].cast("float32")
+        score_b = score[:, :, d:].cast("float32")
 
-        if is_first is not None:
-            # doc_ids at compressed-group granularity: [G]
-            doc_ids = paddle.cumsum(is_first.cast("int32"), axis=0)
-        else:
-            doc_ids = None
-
-        # One learned kernel row per compressed group: [G, K]
-        kernel = self.conv_kernel[:n_groups]
-        # offsets: [K], equal to [-K/2, ..., K/2 - 1]
-        half = self.overlap_conv_kernel_size // 2
-        offsets = paddle.arange(-half, half, dtype="int64")
-        # Base destination positions: [S, 1]
-        tap_indices = paddle.arange(sq, dtype="int64").reshape([-1, 1])
+        # offsets: [K] == [-(K-1), ..., -1, 0]; fully causal window.
+        offsets = paddle.arange(-(k - 1), 1, dtype="int64")
         # Source position for every destination and tap: [S, K]
-        tap_indices = tap_indices + offsets.reshape([1, -1])
+        tap_indices = paddle.arange(sq, dtype="int64").reshape(
+            [-1, 1]
+        ) + offsets.reshape([1, -1])
         # Sequence-boundary validity mask: [S, K]
         valid = (tap_indices >= 0) & (tap_indices < sq)
-        # In-range gather indices; invalid entries are zeroed after gather: [S, K]
+        # In-range gather indices; invalid entries are masked after gather.
         safe_indices = paddle.clip(tap_indices, min=0, max=sq - 1)
+        flat_indices = safe_indices.reshape([-1])  # [S * K]
 
-        # Flatten for paddle.gather: [S * K]
-        flat_indices = safe_indices.reshape([-1])
-        # All b candidates for every destination/tap: [B, S, K, D]
-        b_windows = paddle.gather(value_b, flat_indices, axis=1).reshape(
-            [b, sq, self.overlap_conv_kernel_size, d]
+        def _gather_window(tensor: Tensor) -> Tensor:
+            # [B, S, K, D]
+            return paddle.gather(tensor, flat_indices, axis=1).reshape(
+                [b, sq, k, d]
+            )
+
+        # The first K/2 (most-distant) taps read b; the last K/2 taps read a.
+        # kv_window, score_window: [B, S, K, D]
+        kv_window = paddle.concat(
+            [
+                _gather_window(kv_b)[:, :, :half, :],
+                _gather_window(kv_a)[:, :, half:, :],
+            ],
+            axis=2,
         )
-        # All a candidates for every destination/tap: [B, S, K, D]
-        a_windows = paddle.gather(value_a, flat_indices, axis=1).reshape(
-            [b, sq, self.overlap_conv_kernel_size, d]
-        )
-        # Negative-offset taps use b; zero/positive-offset taps use a:
-        # windows: [B, S, K, D]
-        windows = paddle.concat(
-            [b_windows[:, :, :half, :], a_windows[:, :, half:, :]], axis=2
+        score_window = paddle.concat(
+            [
+                _gather_window(score_b)[:, :, :half, :],
+                _gather_window(score_a)[:, :, half:, :],
+            ],
+            axis=2,
         )
 
-        if doc_ids is not None:
+        if is_first is not None:
+            # Document id at compressed-group granularity: [S]
+            doc_ids = paddle.cumsum(is_first.cast("int32"), axis=0)
             # Document id of each gathered source position: [S, K]
             source_doc_ids = paddle.gather(doc_ids, flat_indices).reshape(
-                [sq, self.overlap_conv_kernel_size]
+                [sq, k]
             )
-            # Reject taps whose source and destination belong to different docs: [S, K]
+            # Reject taps whose source and destination differ in document: [S, K]
             valid = valid & (source_doc_ids == doc_ids.reshape([-1, 1]))
-        # Zero sequence-padding and cross-document taps: [B, S, K, D]
-        windows = paddle.where(
-            valid.reshape([1, sq, self.overlap_conv_kernel_size, 1]),
-            windows,
-            paddle.zeros_like(windows),
+
+        # Paper padding: score -> -inf (zero softmax weight), kv -> 0.
+        valid4 = valid.reshape([1, sq, k, 1])
+        score_window = paddle.where(
+            valid4,
+            score_window,
+            paddle.full_like(score_window, float("-inf")),
         )
-        # Contract K taps independently at every position: [B, S, D]
-        out = paddle.einsum("bskd,sk->bsd", windows, kernel)
+        kv_window = paddle.where(
+            valid4, kv_window, paddle.zeros_like(kv_window)
+        )
+
+        # Softmax over the K taps (per channel), then gated weighted sum.
+        weights = F.softmax(score_window, axis=2)  # [B, S, K, D]
+        out = (weights * kv_window).sum(axis=2)  # [B, S, D]
         return out  # [B, G, D], because R == 1 and S == G
 
     def forward(
@@ -1804,7 +1823,7 @@ class Compressor(nn.Layer):
 
             if self.use_conv_overlap:
                 is_first = docmask_meta.compressed_is_first
-                kv = self._conv_overlap_pool(kv, score, is_first=is_first)
+                kv = self._overlap_window_pool(kv, score, is_first=is_first)
             else:
                 if self.overlap:
                     is_first = docmask_meta.compressed_is_first
@@ -1893,7 +1912,7 @@ class Compressor(nn.Layer):
         score = score + ape
 
         if self.use_conv_overlap:
-            kv = self._conv_overlap_pool(kv, score)
+            kv = self._overlap_window_pool(kv, score)
         else:
             if self.overlap:
                 kv = self._overlap_transform(kv, fill_value=0)
@@ -1924,6 +1943,7 @@ class Compressor(nn.Layer):
                 nope_dim = self.head_dim - self.qk_pos_emb_head_dim
                 kv[..., :nope_dim] = fp8_simulate_qat(kv[..., :nope_dim], 64)
         return kv  # [b, n_compressed, head_dim]
+
 
 # ---------------------------------------------------------------------------
 # CSAIndexer
@@ -2126,7 +2146,7 @@ class CompressedSparseAttention(FleetLayer):
     Conditionally builds Compressor and CSAIndexer based on compress_ratio:
       - ratio=-1 (``CSA_MQA_RATIO``): full-causal MQA, no window/compressor
       - ratio=0: window-only attention
-      - ratio=1: window + learned overlap convolution + CSAIndexer
+      - ratio=1: window + overlapping softmax pooling (sliding window) + CSAIndexer
       - ratio=2..127: window + original overlap pooling + learned CSAIndexer
       - ratio=128: window + 128x compressed, attend to all compressed positions
     """

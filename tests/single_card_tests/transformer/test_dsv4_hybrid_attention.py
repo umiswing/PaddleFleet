@@ -111,21 +111,13 @@ _SEED = 42
 
 
 class TestCompressorConvOverlap(unittest.TestCase):
-    def test_forward_group_is_not_supported(self):
-        fake = type("FakeCompressor", (), {"use_conv_overlap": True})()
-        x_cur = paddle.zeros([1, 1, 1], dtype="float32")
-        with self.assertRaisesRegex(
-            AssertionError, "does not support the learned overlap convolution"
-        ):
-            Compressor.forward_group(fake, x_cur, None, 0)
-
     def test_kernel_size_validation(self):
         for invalid in (0, 3, -2, True):
             with (
                 self.subTest(invalid=invalid),
-                self.assertRaisesRegex(ValueError, "overlap_conv_kernel_size"),
+                self.assertRaisesRegex(ValueError, "csa_overlap_window_size"),
             ):
-                _make_config(overlap_conv_kernel_size=invalid)
+                _make_config(csa_overlap_window_size=invalid)
 
         with self.assertRaisesRegex(
             ValueError, "must be set when csa_compress_ratios contains 1"
@@ -135,7 +127,7 @@ class TestCompressorConvOverlap(unittest.TestCase):
         with self.assertRaisesRegex(
             ValueError, "may only be set when csa_compress_ratios contains 1"
         ):
-            _make_config(overlap_conv_kernel_size=4)
+            _make_config(csa_overlap_window_size=4)
 
         with self.assertRaisesRegex(
             ValueError, "does not support context parallelism"
@@ -143,7 +135,7 @@ class TestCompressorConvOverlap(unittest.TestCase):
             _make_config(
                 num_layers=1,
                 csa_compress_ratios=[1],
-                overlap_conv_kernel_size=4,
+                csa_overlap_window_size=4,
                 context_parallel_size=2,
             )
 
@@ -151,53 +143,85 @@ class TestCompressorConvOverlap(unittest.TestCase):
             ValueError, "does not support context parallelism"
         ):
             _make_config(
-                overlap_conv_kernel_size=4,
+                csa_overlap_window_size=4,
                 context_parallel_size=2,
             )
 
-    def _run(self, value_a, value_b, kernel, is_first=None):
-        ratio = 1
-        n_groups = len(value_a) // ratio
+    def _run(self, kv_a, kv_b, score_a, score_b, window=4, is_first=None):
+        # head_dim == 1 so every position is a scalar.
+        n_groups = len(kv_a)
         fake = type("FakeCompressor", (), {})()
         fake.head_dim = 1
-        fake.overlap_conv_kernel_size = kernel.shape[1]
-        fake.conv_kernel = paddle.to_tensor(kernel, dtype="float32")
+        fake.csa_overlap_window_size = window
+        # Last axis packs [a, b]; _overlap_window_pool splits it into halves.
         kv = paddle.to_tensor(
-            np.stack([value_a, value_b], axis=-1), dtype="float32"
-        ).reshape([1, n_groups, ratio, 2])
-        score = paddle.ones_like(kv)
+            np.stack([kv_a, kv_b], axis=-1), dtype="float32"
+        ).reshape([1, n_groups, 1, 2])
+        score = paddle.to_tensor(
+            np.stack([score_a, score_b], axis=-1), dtype="float32"
+        ).reshape([1, n_groups, 1, 2])
         if is_first is not None:
             is_first = paddle.to_tensor(is_first, dtype="bool")
-        return Compressor._conv_overlap_pool(fake, kv, score, is_first)
+        return Compressor._overlap_window_pool(fake, kv, score, is_first)
+
+    @staticmethod
+    def _reference(kv_a, kv_b, score_a, score_b, window, doc_ids=None):
+        """NumPy reference for the overlapping softmax pooling (Eq. 11-12)."""
+        seq = len(kv_a)
+        half = window // 2
+        # Fully causal window: offsets [-(window-1), ..., -1, 0].
+        offsets = list(range(-(window - 1), 1))
+        out = np.zeros(seq, dtype="float64")
+        for i in range(seq):
+            taps_kv, taps_sc = [], []
+            # First half (most-distant) taps read b: offsets [-(window-1), ..., -half].
+            for off in offsets[:half]:
+                j = i + off
+                valid = 0 <= j < seq and (
+                    doc_ids is None or doc_ids[j] == doc_ids[i]
+                )
+                taps_kv.append(kv_b[j] if valid else 0.0)
+                taps_sc.append(score_b[j] if valid else -np.inf)
+            # Second half taps read a (current-and-preceding): offsets [-half+1, ..., 0].
+            for off in offsets[half:]:
+                j = i + off
+                valid = 0 <= j < seq and (
+                    doc_ids is None or doc_ids[j] == doc_ids[i]
+                )
+                taps_kv.append(kv_a[j] if valid else 0.0)
+                taps_sc.append(score_a[j] if valid else -np.inf)
+            w = np.array(taps_sc, dtype="float64")
+            w = np.exp(w - np.max(w))
+            w = w / w.sum()
+            out[i] = np.dot(w, np.array(taps_kv, dtype="float64"))
+        return out
 
     def test_exact_four_tap_formula(self):
-        a = np.arange(1, 9, dtype="float32")
-        b = np.arange(11, 19, dtype="float32")
-        kernel = np.arange(1, 33, dtype="float32").reshape([8, 4])
-        per_token = np.zeros(8, dtype="float32")
-        for i in range(8):
-            taps = [
-                b[i - 2] if i >= 2 else 0,
-                b[i - 1] if i >= 1 else 0,
-                a[i],
-                a[i + 1] if i + 1 < 8 else 0,
-            ]
-            per_token[i] = np.dot(kernel[i], taps)
-        expected = per_token
-        np.testing.assert_allclose(self._run(a, b, kernel).numpy()[0], expected)
+        ka = np.arange(1, 9, dtype="float32")
+        kb = np.arange(11, 19, dtype="float32")
+        sa = np.linspace(0.1, 0.8, 8).astype("float32")
+        sb = np.linspace(-0.3, 0.4, 8).astype("float32")
+        expected = self._reference(ka, kb, sa, sb, window=4)
+        out = self._run(ka, kb, sa, sb, window=4).numpy()[0, :, 0]
+        np.testing.assert_allclose(out, expected, rtol=1e-5, atol=1e-5)
 
     def test_document_boundary_taps_are_zero(self):
-        a = np.ones(8, dtype="float32")
-        b = np.ones(8, dtype="float32")
-        kernel = np.ones([8, 4], dtype="float32")
-        result = self._run(
-            a,
-            b,
-            kernel,
-            is_first=[True, False, False, False, True, False, False, False],
-        ).numpy()[0]
-        # Each four-token document is evaluated independently.
-        np.testing.assert_array_equal(result[:4], result[4:])
+        # Two identical four-token documents packed back to back.
+        ka = np.array([1, 2, 3, 4, 1, 2, 3, 4], dtype="float32")
+        kb = np.array([5, 6, 7, 8, 5, 6, 7, 8], dtype="float32")
+        sa = np.array([0.1, 0.2, 0.3, 0.4, 0.1, 0.2, 0.3, 0.4], dtype="float32")
+        sb = np.array([0.5, 0.6, 0.7, 0.8, 0.5, 0.6, 0.7, 0.8], dtype="float32")
+        is_first = [True, False, False, False, True, False, False, False]
+        result = self._run(ka, kb, sa, sb, window=4, is_first=is_first).numpy()[
+            0, :, 0
+        ]
+        # Each four-token document is pooled independently, so the two docs
+        # must produce identical outputs (no taps cross the boundary).
+        np.testing.assert_allclose(result[:4], result[4:], rtol=1e-5, atol=1e-5)
+        # And the per-document result must match the reference with doc ids.
+        doc_ids = np.cumsum(np.array(is_first, dtype="int32"))
+        expected = self._reference(ka, kb, sa, sb, window=4, doc_ids=doc_ids)
+        np.testing.assert_allclose(result, expected, rtol=1e-5, atol=1e-5)
 
 
 class _FakeGroup:
@@ -261,7 +285,7 @@ def _make_config(
     hybrid_mla_num_key_value_heads=64,
     non_absorbed_mqa=False,
     add_full_attention_sink_bias=False,
-    overlap_conv_kernel_size=None,
+    csa_overlap_window_size=None,
 ):
     if csa_compress_ratios is None:
         csa_compress_ratios = [0, 4, 128, 4]
@@ -300,7 +324,7 @@ def _make_config(
         use_qk_norm=True,
         csa_compress_ratios=csa_compress_ratios,
         csa_window_size=csa_window_size,
-        overlap_conv_kernel_size=overlap_conv_kernel_size,
+        csa_overlap_window_size=csa_overlap_window_size,
         dsa_index_n_heads=dsa_index_n_heads,
         dsa_index_head_dim=dsa_index_head_dim,
         dsa_index_topk=dsa_index_topk,
@@ -493,7 +517,7 @@ class TestDSv4HybridConfigAndSpec(unittest.TestCase):
         cfg = _make_config(
             num_layers=1,
             csa_compress_ratios=[1],
-            overlap_conv_kernel_size=4,
+            csa_overlap_window_size=4,
         )
         self.assertEqual(cfg.csa_compress_ratios, [1])
 
@@ -1731,19 +1755,21 @@ class TestDSv4HybridAttentionConstructor(unittest.TestCase):
         self.assertFalse(attn.core_attention.compressor.use_conv_overlap)
         self.assertIsNotNone(attn.core_attention.indexer)
 
-        # Ratio 1 builds the learned overlap-convolution compressor.
+        # Ratio 1 builds the overlap-window softmax-pooling compressor.
         config = _make_config(
             num_layers=1,
             csa_compress_ratios=[1],
-            overlap_conv_kernel_size=4,
+            csa_overlap_window_size=4,
         )
         config.max_seq_length = 4096
         attn = _build_attention(config, layer_number=0)
         self.assertTrue(attn.core_attention.compressor.overlap)
         self.assertTrue(attn.core_attention.compressor.use_conv_overlap)
+        # The pooling has no learned kernel; only the window size is retained.
+        self.assertFalse(hasattr(attn.core_attention.compressor, "conv_kernel"))
         self.assertEqual(
-            list(attn.core_attention.compressor.conv_kernel.shape),
-            [config.max_seq_length, config.overlap_conv_kernel_size],
+            attn.core_attention.compressor.csa_overlap_window_size,
+            config.csa_overlap_window_size,
         )
 
         # ratio 129 is above HCA (128) -> rejected.

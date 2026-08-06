@@ -1046,13 +1046,15 @@ class TransformerConfig(ModelParallelConfig):
     Each query attends to the last csa_window_size tokens via a sliding window.
     """
 
-    overlap_conv_kernel_size: int | None = None
-    """Kernel width of the CSA compressor's learned overlap convolution.
+    csa_overlap_window_size: int | None = None
+    """Window width of the CSA compressor's overlapping softmax pooling.
 
     Must be set to a positive even integer if and only if at least one layer
-    has ``compress_ratio == 1``. Half of the taps read preceding ``b`` entries
-    and half read the current/following ``a`` entries. This mode currently
-    requires ``context_parallel_size == 1``.
+    has ``compress_ratio == 1``. It is the number of taps pooled per output
+    position over a fully causal window ``[i-(K-1), ..., i]``: the first half
+    read the preceding ``b`` entries and the second half read the
+    current-and-preceding ``a`` entries, softmax-normalised jointly (paper
+    Eq. 11-12). This mode currently requires ``context_parallel_size == 1``.
     """
 
     csa_compress_ratios: list | None = None
@@ -1060,7 +1062,8 @@ class TransformerConfig(ModelParallelConfig):
     Length must equal num_hidden_layers (+ mtp_num_layers if present).
     Each entry encodes the layer kind via its integer ratio value:
       - 0: window-only attention (no compression)
-      - 1: CSA layer using the learned overlap convolution without downsampling
+      - 1: CSA layer using overlapping softmax pooling over a sliding window
+        (``csa_overlap_window_size`` taps) without downsampling the sequence
       - 2..127: CSA layer using the original overlap transform with learned
         Lightning Indexer. The compression rate is a free parameter of CSA;
         any integer in [2, 127] is accepted (e.g. 4, 8, 16, ...), including
@@ -1209,7 +1212,7 @@ class TransformerConfig(ModelParallelConfig):
         "indexer_rope_interleave": "dsa_indexer_rotary_interleaved",
         # CSA / DSv4 Hybrid field mapping
         "csa_window_size": "csa_window_size",
-        "overlap_conv_kernel_size": "overlap_conv_kernel_size",
+        "csa_overlap_window_size": "csa_overlap_window_size",
         "csa_compress_ratios": "csa_compress_ratios",
         "csa_compress_rotary_base": "csa_compress_rotary_base",
         "csa_dense_mode": "csa_dense_mode",
@@ -1485,15 +1488,15 @@ class TransformerConfig(ModelParallelConfig):
 
         # DSv4 Hybrid Attention validation
         if self.experimental_attention_variant == "dsv4_hybrid":
-            if self.overlap_conv_kernel_size is not None and (
-                not isinstance(self.overlap_conv_kernel_size, int)
-                or isinstance(self.overlap_conv_kernel_size, bool)
-                or self.overlap_conv_kernel_size <= 0
-                or self.overlap_conv_kernel_size % 2 != 0
+            if self.csa_overlap_window_size is not None and (
+                not isinstance(self.csa_overlap_window_size, int)
+                or isinstance(self.csa_overlap_window_size, bool)
+                or self.csa_overlap_window_size <= 0
+                or self.csa_overlap_window_size % 2 != 0
             ):
                 raise ValueError(
-                    "overlap_conv_kernel_size must be a positive even integer, "
-                    f"got {self.overlap_conv_kernel_size}."
+                    "csa_overlap_window_size must be a positive even integer, "
+                    f"got {self.csa_overlap_window_size}."
                 )
             if self.csa_compress_ratios is None:
                 raise ValueError(
@@ -1502,15 +1505,15 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if (
                 1 in self.csa_compress_ratios
-                and self.overlap_conv_kernel_size is None
+                and self.csa_overlap_window_size is None
             ):
                 raise ValueError(
-                    "overlap_conv_kernel_size must be set when "
+                    "csa_overlap_window_size must be set when "
                     "csa_compress_ratios contains 1."
                 )
             if (
                 1 in self.csa_compress_ratios
-                or self.overlap_conv_kernel_size is not None
+                or self.csa_overlap_window_size is not None
             ) and self.context_parallel_size != 1:
                 raise ValueError(
                     "compress_ratio=1 overlap convolution does not support "
@@ -1518,11 +1521,11 @@ class TransformerConfig(ModelParallelConfig):
                     f"got {self.context_parallel_size}."
                 )
             if (
-                self.overlap_conv_kernel_size is not None
+                self.csa_overlap_window_size is not None
                 and 1 not in self.csa_compress_ratios
             ):
                 raise ValueError(
-                    "overlap_conv_kernel_size may only be set when "
+                    "csa_overlap_window_size may only be set when "
                     "csa_compress_ratios contains 1."
                 )
             mtp_num_layers = (

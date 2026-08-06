@@ -181,7 +181,7 @@ def _get_dsv4_hybrid_attention_layer_type(
     ratio = int(ratio)
     if ratio == -2:
         attention_layer_type = "multi_latent_attention"
-    elif ratio in (-1, 0, 128) or 2 <= ratio < 128:
+    elif ratio in (-1, 0, 128) or 1 <= ratio < 128:
         attention_layer_type = "dsv4_hybrid_attention"
     else:
         raise ValueError(
