@@ -1,0 +1,256 @@
+# ============================================================================
+# SLASH Research — MLA 0.6B dense pretrain (pure MLA, full attention, DENSE)
+# 基于 conf/online/ernielite_10B_A1B_pretrain_mla_hca_vha.yaml
+#   - 融合开关变量名已升级为 fused_* 新命名
+#   - 已剥离 HCA/VHA/CSA 相关项, 以及 MoE-only 项 (dense 模型)
+#   - model_config: 纯 MLA dense (moe_layer_freq=[0]*28), 见
+#     third_party/PaddleFleet/Research/SLASH/model_configs/mla_0p6B_dense/model_config.json
+#   - backbone 取自 Qwen3-0.6B (L28/hidden1024/FFN3072), 仅换 MLA
+#   - 8K base 阶段: seqlen==8192 (FineWeb-edu ctx8k BFD 数据)
+#   - NOTE: 纯 dense 的 ernie5_v2 仓库内无现成配置, 首次跑建议先 build 验证构图
+# ============================================================================
+
+# ---------------------------model args-------------------------------------------------#
+tokenizer_name: /root/afs_ro/cnn-bd-main.afs.baidu.com/user/erine/shangjunyuan/hub/ernie5_tk_m102k_vid6p1/
+is_eb5: true
+max_seq_length: 8192
+num_consecutive: 1
+shuffle_consecutive: false
+online_generate_data: true
+sync_down: true
+multi_process: 10
+load_process_num: 8
+lru_h5_cache_num: 1000
+dataset_meta_cache_path: ./dataset_cache_meta.bin
+bos_retry_max_time: 5
+bos_retry_interval: 1
+
+data_filelist: third_party/PaddleFleet/Research/SLASH/datas/vocsize-102400-ctx-8k.zy
+data_weights: third_party/PaddleFleet/Research/SLASH/datas/vocsize-102400-ctx-8k.ratio
+
+model_name_or_path: ./third_party/PaddleFleet/Research/SLASH/model_configs/mla_0p6B_dense
+
+# flashmask_use_varlen: True
+_attn_implementation: flashmask
+use_ue8m0: false
+
+document_mask_prob_text: 0.5 # 文本使用document mask 概率
+
+num_empty_layers_add_in_head: 0
+num_empty_layers_add_in_tail: 0
+
+# --- 融合开关 (dense: 仅保留通用项, MoE 融合项已去除) ---
+fused_qk_norm: false
+fp32_residual_connection: false
+bias_dropout_fusion: true
+bias_activation_fusion: true
+layer_types:
+
+separate_mtp_headloss: false
+fused_linear_ce_loss_chunk: 4
+
+# 重计算 (dense: 仅 full_attn)
+#recompute_granularity: selective
+#recompute_modules: ["full_attn"]
+
+apply_rope_fusion: false
+
+# 参数初始化 (init_std = 1/sqrt(3*hidden_size); hidden=1024 -> 0.01804129378)
+embedding_init_method_std: 0.01804129378
+init_method_std: 0.01804129378
+
+gpt_model_use_experimental_version: false
+mtp_loss_scaling_factor: 0.3
+add_mtp_loss: false
+use_truncated_normal_init: true
+
+#################### 多模相关占位 Start (纯文本研究保留占位以确保 eb5 构图)
+use_utf16be_and_eb5tk: true # 是否使用102400 新eb5词表以及utf16be编码
+use_v2_tokenizer_and_bypass_mm: true # 使用v2 tokenizer并跳过多模态token解析
+mtp_attention_flexible: true # mtp支持自定义Attention Mask
+reweight_loss_by_scale: true
+scale_accumulate_embedding: true
+scale_type_embedding: false
+reweight_ratios: [1.5, 1]
+
+visual_tknz_config: ./third_party/baidu/personal-code/tokenizer-core/config_3d_64bit.yaml # new tknz for formal training
+visual_tknz_ckpt: ./64bit.ckpt # ./epoch=0-step=990000.ckpt # !!LXX!!
+
+image_patch_id: 500000
+image_gen_patch_id: 500000
+image_vocab_size: 2**64  # 2**128
+image_code_depth: 1
+image_head_indices: [20]
+image_share_vocab: true
+
+image_infinity: true
+infinity_scale_num: 64
+image_full_feature_size: 1536
+image_feature_size: 64
+image_sub_vocab_loss_mode: "sum"
+vision_cnn_size: 256
+vision_vit_size: 1280
+num_merge_attn_heads: 16
+vision_und_skip_first_scale: true
+
+random_flip_max_prob: 0.3
+
+split_understanding_generation: true
+image_max_merge_size: 2
+ignore_image_loss: true  # 理解任务不算图像Loss
+ignore_stem_loss: true # 生成任务不算文本Loss
+
+video_patch_id: 500000
+video_gen_patch_id: 500000
+video_vocab_size: 2**64  # 2**128
+video_code_depth: 1
+video_head_indices: [20]
+video_share_vocab: true
+
+video_infinity: true
+video_infinity_scale_num: 64
+video_full_feature_size: 1536
+video_feature_size: 64
+video_sub_vocab_loss_mode: "sum"
+
+image_und_resolution: 2048
+video_und_resolution: 512
+video_merge_4in1: true
+video_und_skip_first_scale: true
+
+audio_patch_id: 500000
+audio_vocab_size: 2056
+audio_code_depth: 1
+audio_share_vocab: false
+audio_spk_patch_id: 500000
+audio_spk_emb_dim: 192
+
+audio_head_indices: [0]
+audio_loss_reweight: "loss_scale_decay" # 20250710上线
+#################### 多模相关占位 End
+
+# ---------------------------trainer args-------------------------------------------------#
+save_hf_memory_growth_threshold: 4
+online_merge_ema: true
+do_train: true
+seed: 42
+
+# 数据加载 —— 8K base (FineWeb-edu ctx8k BFD); token-batch 沿用 Kimi 计划 ~1.05M/step
+# gbs=128 (=64卡 × per_device2 × acc1), seqlen8192 -> 1.05M tokens/step
+sharding_parallel_size: 64
+global_batch_size: 128
+per_device_train_batch_size: 2
+per_device_eval_batch_size: 1
+gradient_accumulation_steps: 1
+dataloader_num_workers: 8
+prefetch_factor: 100
+max_workers: 12
+
+# 训练步数 (compute-optimal: D=0.0135*N_active^1.236≈27.5B tokens; /1.05M tok每步)
+max_steps: 26000
+save_steps: 2000
+save_hf_steps: 26000
+logging_steps: 1
+
+use_elastic_layer: false
+use_elastic_native_layer: false
+use_pp_balance_elastic_layer: false
+
+# 学习率和优化器 (采用 Kimi Linear 的 Muon lr: lr=26.4e-3*N_active^-0.398; N≈475M -> 2.271e-3)
+lr_scheduler: wsd
+learning_rate: 2.271e-3
+max_grad_norm: 1.0
+weight_decay: 0.1
+warmup_steps: 2000
+adam_beta1: 0.9
+adam_beta2: 0.95
+adam_epsilon: 1e-15
+min_lr: 0
+
+output_dir: ./output/mla_0p6B_dense_8k
+metrics_output_path: ./output/paddle_distributed_logs/
+save_total_limit: 5
+save_checkpoint_format: flex_checkpoint
+load_checkpoint_format: flex_checkpoint
+flex_ckpt_comm_method: parallel_broadcast
+load_via_cpu: false
+overwrite_output_dir: 1
+ignore_load_lr_and_optim: false
+sharded_model_from_ema: false
+load_sharded_model: false
+save_sharded_model: false
+
+# 混合精度和损失缩放
+bf16: true
+fp16_opt_level: O2
+scale_loss: 4096
+amp_master_grad: true
+
+# debug_reeao_dataset_world_size: 50  # 调试专用: 强制 dp_size=50 单路加载; 真实多卡训练必须注释掉(dp_rank>=50 会越界报 IndexError)
+# 分布式并行配置 (dense: 无专家并行)
+tensor_model_parallel_size: 1
+expert_model_parallel_size: 1
+pipeline_model_parallel_size: 1
+virtual_pipeline_model_parallel_size: 1
+context_parallel_size: 1
+sequence_parallel: 0
+
+# 分片配置
+sharding: stage1
+split_param: true
+fuse_optimizer_states: true
+
+pp_delay_scale_loss: true
+pp_sync_moment: true
+pp_sync_param: true
+sync_grad: true
+
+overlap_p2p_comm: true
+variable_seq_lengths: true
+best_unbalanced_scheduler: true
+
+tp_sync_param: true
+tp_sync_moment: true
+
+# MoE 配置 (dense: 关闭)
+use_moe: false
+use_expert_parallel: false
+
+hybrid_parallel_topo_order: sharding_first
+skip_profile_timer: false
+
+offload_pipeline_dataset: false
+enable_aadiff_online_check: false
+
+log_global_grad_norm: true
+enable_global_training_logs: false
+model_backend: "fleet"
+shard_smooth_alpha: 1
+same_data: ''
+enable_mtp_magic_send: false
+use_gpu_affinity: true
+global_logging_interval: 10
+pre_alloc_memory: 65
+pre_alloc_pin_memory: 10
+sharding_comm_buffer_size_MB: 2048
+
+# 内科监控 (dense: 去掉 moe_health / mhc_health)
+internal_medicine_monitors: qk_stats,massive_act
+internal_medicine_monitor_interval: 200
+internal_medicine_qk_row_stride: 1
+
+optim: muon
+muon_configs:
+    muon_momentum: 0.95
+    muon_version: 3
+    muon_extra_scale_factor: 0.2
+    muon_ns_steps: 5
+    muon_ns_coeff_type: "quintic"
+    muon_exclude_patterns:
+    - "embed"
+    - "bias"
+    - "lm_head"
+    - "mlp.gate"
+    - "ape"
+    muon_qkv_update_mode: "split_head"
+    muon_ffn_split: true

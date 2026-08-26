@@ -1,0 +1,324 @@
+# -----------环境变量----------------------#
+
+# ---------------------------model args-------------------------------------------------#
+tokenizer_name: /root/afs_ro/cnn-bd-main.afs.baidu.com/user/erine/shangjunyuan/hub/ernie5_tk_m102k_vid6p1/
+is_eb5: true
+max_seq_length: 8192
+num_consecutive: 1
+shuffle_consecutive: false
+online_generate_data: true
+sync_down: true
+# multi_process: 32
+multi_process: 8
+load_process_num: 1
+lru_h5_cache_num: 1000
+dataset_meta_cache_path: ./dataset_cache_meta.bin
+bos_retry_max_time: 5
+bos_retry_interval: 1
+
+# data_filelist: conf/allinone/eb5/EB5Pretrain-260803-a1b-v19p8-bfd-8k.zy
+# data_weights: conf/allinone/eb5/EB5Pretrain-260803-a1b-v19p8-bfd-8k.ratio
+data_filelist: third_party/PaddleFleet/Research/SLASH/datas/vocsize-102400-ctx-8k.zy
+data_weights: third_party/PaddleFleet/Research/SLASH/datas/vocsize-102400-ctx-8k.ratio
+
+model_name_or_path: ./model_config_separated/conf/fleet_align/eb5_v2_4B_A600M_mhc_swa_3to1/
+
+# ---------------------------mHC (Manifold-Constrained Hyper-Connections)-----------------#
+# enable_hyper_connections 属于 _MODEL_STRUCTURE_FIELDS，只能写在 model_config.json，
+# 写在这里会被 pretrain.py 的 _check_yaml_not_override_json 拦下。
+# 基座是仓库既有的 4B_A600M（层数 16、moe_intermediate_size 1024、heads 16、专家 64、
+# 无 MTP），与 10B 在专家形状 moe_I/latent=2.0 和 attention 头数上对齐。
+num_residual_streams: 4
+use_fused_mhc: false
+
+# ---------------------------混合注意力 3 full MLA : 1 SWA-------------------------------#
+# SWA 相关字段全部属于 _MODEL_STRUCTURE_FIELDS，只能写在 model_config.json，写在这里会被
+# pretrain.py 的 _check_yaml_not_override_json 拦下。见：
+#   model_config_separated/conf/fleet_align/eb5_v2_4B_A600M_mhc_swa_3to1/model_config.json
+#   sliding_window: [128, 128]          左窗 128 生效（右窗在 flashmask 路径被忽略）
+#   window_attn_skip_freq: [0,0,0,1]×4  0=full MLA、1=SWA；layer 3/7/11/15 是 SWA
+#   swa_* 与基础字段同形（heads=16, v_head_dim=256）→ param count 与布局不变
+#   add_swa/full_attention_sink_bias: false  避免触发 FA3/4 版本检查
+# SWA 只改注意力掩码、不改任何权重 shape；mHC 的 HyperConnectionTransformerLayer 里没有
+# is_swa 分支，SWA 对 mHC 透明。
+_attn_implementation: flashmask
+moe_router_bias_update_rate: 1e-4
+num_empty_layers_add_in_head: 0
+num_empty_layers_add_in_tail: 2
+
+fp32_residual_connection: false
+
+bias_dropout_fusion: true
+
+moe_shared_expert_overlap: true
+bias_activation_fusion: true
+layer_types:
+moe_logging: false
+apply_rope_fusion: false
+
+# fused_mrope: True
+fused_moe_topk: true
+fused_routing_map: false
+fused_qk_norm: false
+
+moe_expert_fusion: true
+moe_deep_gemm: false
+
+deepep_buffer_configs:
+  num_sms: 52
+  dispatch_config: [60, 256]
+  combine_config: [20, 256]
+
+# 参数初始化
+embedding_init_method_std: 0.01804129378
+init_method_std: 0.01804129378
+
+#################### 多模相关占位 Start
+use_utf16be_and_eb5tk: true # 是否使用102400 新eb5词表以及utf16be编码
+use_v2_tokenizer_and_bypass_mm: true # 使用v2 tokenizer并跳过多模态token解析
+document_mask_prob_text: 0.5 # 文本使用document mask 概率
+mtp_attention_flexible: true # mtp支持自定义Attention Mask
+reweight_loss_by_scale: true
+scale_accumulate_embedding: true
+scale_type_embedding: false
+reweight_ratios: [1.5, 1]
+
+visual_tknz_config: ./third_party/baidu/personal-code/tokenizer-core/config_3d_64bit.yaml # new tknz for formal training
+visual_tknz_ckpt: ./64bit.ckpt # ./epoch=0-step=990000.ckpt # !!LXX!!
+
+image_patch_id: 500000
+image_gen_patch_id: 500000
+image_vocab_size: 2**64 # 2**128
+image_code_depth: 1
+image_head_indices: [14]
+image_share_vocab: true
+
+image_infinity: true
+infinity_scale_num: 64
+image_full_feature_size: 1536
+image_feature_size: 64
+image_sub_vocab_loss_mode: "sum"
+vision_cnn_size: 256
+vision_vit_size: 1280
+num_merge_attn_heads: 16
+vision_und_skip_first_scale: true
+
+random_flip_max_prob: 0.3
+
+split_understanding_generation: true
+image_max_merge_size: 2
+ignore_image_loss: true # 理解任务不算图像Loss
+ignore_stem_loss: true # 生成任务不算文本Loss
+
+# video_patch_id: 500000
+video_patch_id: 500000
+video_gen_patch_id: 500000
+video_vocab_size: 2**64 # 2**128
+video_code_depth: 1
+video_head_indices: [14]
+# video_head_indices: [31]
+video_share_vocab: true
+
+video_infinity: true
+video_infinity_scale_num: 64
+video_full_feature_size: 1536
+video_feature_size: 64
+video_sub_vocab_loss_mode: "sum"
+
+image_und_resolution: 2048
+video_und_resolution: 512
+video_merge_4in1: true
+video_und_skip_first_scale: true
+
+audio_patch_id: 500000
+audio_vocab_size: 2056
+audio_code_depth: 1
+audio_share_vocab: false
+audio_spk_patch_id: 500000
+audio_spk_emb_dim: 192
+
+audio_head_indices: [0]
+# audio_loss_reweight: "tail_mask"  # 20250627上线
+audio_loss_reweight: "loss_scale_decay" # 20250710上线
+
+use_ue8m0: false # sometimes会CUDA Error
+moe_dequant_input: true
+offline_quant_expert_weight: true
+using_cache_weight_quant_transpose: true
+
+separate_mtp_headloss: false
+
+# 重计算
+# 保持基线的 full 重计算：HyperConnectionTransformerLayer 继承 TransformerLayer 的
+# full_recompute 整层包裹，已覆盖 mHC 的 n*C 残差激活。
+recompute_granularity: full
+recompute_method: uniform
+recompute_num_layers: 1
+
+fused_linear_ce_loss_chunk: 4
+
+# ---------------------------trainer args-------------------------------------------------#
+save_hf_memory_growth_threshold: 4
+online_merge_ema: true
+# 基础训练配置
+do_train: true
+seed: 42
+
+# 数据加载
+# 单机 8 卡: TP=PP=1 → sharding_parallel_size=8 → dataset_world_size=8
+# batch_per_device = 288/8 = 36, 需被 per_device 整除 (training_utils.py:31)
+# mHC 取满 36×1；xHC 因显存用 12×3。
+global_batch_size: 320
+per_device_train_batch_size: 5
+per_device_eval_batch_size: 1
+gradient_accumulation_steps: 1
+dataloader_num_workers: 8
+# prefetch_factor: 100
+prefetch_factor: 10
+max_workers: 12
+
+# PDC相关
+pdc_download_ckpt: false
+pdc_download_timeout: 300
+save_tokenizer: false
+save_rng_states: true
+# flash_device_save_steps: 15
+
+# Flash保存相关
+# 照 exp611：关闭 zcc，走标准 flex_checkpoint 存盘，save_total_limit 才生效
+# （zcc 路径绕过 _rotate_checkpoints，不会删旧 ckpt）。
+# enable_zero_cost_checkpoint: true
+replicate_saved_into_local: true
+ignore_data_skip: 0
+# 从头全新起训（与 mhc_baseline 同起点独立对照）。
+# 说明：SWA 只改掩码不改权重 shape，技术上可以从 baseline ckpt 热启；如需热启把下面这行取消注释。
+# resume_from_checkpoint: /root/paddlejob/share-storage/gpfs/system-public/lishuai36/paddle_job/erniebot/output/eb5_4B_A600M_moe_mhc_baseline/checkpoint-28500
+# zcc_workers_num: 1
+# zcc_pipeline_hooks_capacity_usage: 0.8
+# zcc_save_ema_coef: 0.9974
+# zcc_ema_interval: 15
+# zcc_ema_loss_threshold: 2
+
+# 训练步数和日志
+max_steps: 1000000
+save_steps: 1000
+save_hf_steps: -1
+logging_steps: 1
+
+# 弹性层
+use_elastic_layer: false
+use_elastic_native_layer: false
+use_pp_balance_elastic_layer: false
+
+# 学习率和优化器
+lr_scheduler: wsd
+max_grad_norm: 1.0
+weight_decay: 0.1
+warmup_steps: 1000
+adam_beta1: 0.9
+adam_beta2: 0.95
+adam_epsilon: 1e-15
+min_lr: 0
+
+# 输出和保存
+output_dir: ./output/eb5_4B_A600M_moe_mhc_swa_3to1
+# logging_dir: ./vdl_log
+metrics_output_path: ./output/paddle_distributed_logs_mhc_swa_3to1/
+save_total_limit: 5
+save_checkpoint_format: flex_checkpoint
+load_checkpoint_format: flex_checkpoint
+flex_ckpt_comm_method: parallel_broadcast
+load_via_cpu: false
+overwrite_output_dir: 1
+ignore_load_lr_and_optim: false
+sharded_model_from_ema: false
+load_sharded_model: false
+save_sharded_model: false
+
+# 混合精度和损失缩放
+bf16: true
+fp16_opt_level: O2
+scale_loss: 4096
+amp_master_grad: true
+
+# debug_reeao_dataset_world_size: 50 # 模拟真实 sharding 路数,用于单路调试,加速数据加载
+# 分布式并行配置
+tensor_model_parallel_size: 1
+expert_model_parallel_size: 8
+pipeline_model_parallel_size: 1
+virtual_pipeline_model_parallel_size: 1
+context_parallel_size: 1
+sequence_parallel: 0
+
+# 分片配置
+sharding: stage1
+split_param: true
+fuse_optimizer_states: true
+
+# Pipeline 并行配置
+pp_delay_scale_loss: true
+pp_sync_moment: true
+pp_sync_param: true
+sync_grad: true
+
+overlap_p2p_comm: true
+variable_seq_lengths: true
+best_unbalanced_scheduler: true
+
+# Tensor 并行配置
+tp_sync_param: true
+tp_sync_moment: true
+
+# MoE 配置
+use_moe: true
+use_expert_parallel: true
+
+# 其他优化配置
+hybrid_parallel_topo_order: sharding_first
+skip_profile_timer: false
+#tensorwise_offload_optimizer: true
+
+# fuse_rms_norm: true
+learning_rate: 6e-4
+
+offload_pipeline_dataset: false
+enable_aadiff_online_check: false
+
+log_global_grad_norm: true
+enable_global_training_logs: false
+model_backend: "fleet"
+# log_input_md5: true
+shard_smooth_alpha: 1
+same_data: ''
+enable_mtp_magic_send: false
+use_gpu_affinity: true
+global_logging_interval: 10
+# B30Z 275GB/卡，B 卡一律预留 220GB。
+pre_alloc_memory: 65
+pre_alloc_pin_memory: 10
+sharding_comm_buffer_size_MB: 512
+
+# Loss监控配置
+optim: muon
+muon_configs:
+  muon_momentum: 0.95
+  muon_version: 3
+  muon_extra_scale_factor: 0.2
+  muon_ns_steps: 5
+  muon_ns_coeff_type: "quintic"
+  muon_exclude_patterns:
+    - "embed"
+    - "bias"
+    - "lm_head"
+    - "mlp.gate"
+  muon_qkv_update_mode: "split_head"
+  muon_ffn_split: true
+mtp_loss_scaling_factor: 0.3
+add_mtp_loss: false
+gpt_model_use_experimental_version: false
+
+# 内科监控
+# internal_medicine_monitors: qk_stats,moe_health,massive_act,mhc_health  # 或写 all
+internal_medicine_monitors: all
+internal_medicine_monitor_interval: 200 # save_step 的整数倍
+internal_medicine_qk_row_stride: 1 # 默认为1，1的成本最大

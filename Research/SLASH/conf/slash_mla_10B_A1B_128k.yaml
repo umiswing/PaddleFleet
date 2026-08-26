@@ -1,0 +1,28 @@
+# === 10B-A1B — 128K 长文阶段 (override; 续 32K, 连续 cosine) ===
+# 用法: --configs third_party/PaddleFleet/Research/SLASH/conf/slash_mla_10B_A1B_8k.yaml third_party/PaddleFleet/Research/SLASH/conf/slash_mla_10B_A1B_128k.yaml
+#       并从 32K 的 checkpoint resume (必须, 以恢复 LR_Scheduler 使 cosine 连续)
+
+model_name_or_path: ./third_party/PaddleFleet/Research/SLASH/model_configs/mla_10B_A1B_128k
+max_seq_length: 131072
+
+# 128K 必须 context parallel: CP=8 -> DP=64/8=8; EP=8 分区 DP(=8); gbs=16 (=8 × per_device1 × acc2)
+# tokens/step=2.1M。CP 与 EP 的具体拓扑以框架为准 (64 = CP8 × DP8, EP 在 DP 内)。
+context_parallel_size: 8
+global_batch_size: 16
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 2
+
+# 连续 cosine: 与 32K 同 horizon/peak/min; resume 32K ckpt(step~9500, 恢复 LR_Scheduler)
+# -> lr 从 ~1.05e-4 续接衰到 1e-5, 不重启
+lr_scheduler: cosine
+learning_rate: 1.9e-4
+min_lr: 1e-5
+warmup_steps: 200
+max_steps: 19000
+save_steps: 500
+output_dir: ./output/slash_mla_10B_A1B_128k
+
+# resume_from_checkpoint: <32K ckpt path>   # 必须
+# 数据: 128K 长文数据 (SLASH/datas)
+data_filelist: third_party/PaddleFleet/Research/SLASH/datas/vocsize-102400-ctx-128k.zy
+data_weights: third_party/PaddleFleet/Research/SLASH/datas/vocsize-102400-ctx-128k.ratio

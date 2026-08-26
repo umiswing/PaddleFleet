@@ -1,0 +1,24 @@
+# === 0.6B dense — 单机8卡验证 override (叠在 8k base 之上) ===
+# 用法:
+#   --configs third_party/PaddleFleet/Research/SLASH/conf/slash_mla_0p6B_dense_8k.yaml \
+#             third_party/PaddleFleet/Research/SLASH/conf/slash_mla_0p6B_dense_8k_1node.yaml
+# 节点选择: 用 script/selective_launch.py 选单个 rank
+#   (rank0=10.79.184.226 全空最优; parse_ranks 里 return [0], 见下方说明)
+# 目的: 快速验证 0.6B 8K 能正常构图 + 数据加载 + 训几步, 非正式训练。
+
+# 单机 8 卡: sharding_parallel_size=8 (=总卡数), EP=1(dense)
+sharding_parallel_size: 8
+expert_model_parallel_size: 1
+
+# batch: 8 * per_device * acc = gbs; 验证用小 batch
+global_batch_size: 16
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 1
+
+# 验证: 只跑少量步, 短 warmup, 不存档
+max_steps: 20
+warmup_steps: 5
+save_steps: 100000
+save_hf_steps: 100000
+logging_steps: 1
+output_dir: ./output/slash_mla_0p6B_dense_8k_1node_val

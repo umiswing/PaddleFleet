@@ -1,0 +1,26 @@
+# === 1.7B dense — 32K 长文阶段 (override, 层叠在 4K base 之上) ===
+# 用法: --configs third_party/PaddleFleet/Research/SLASH/conf/slash_mla_1p7B_dense_8k.yaml third_party/PaddleFleet/Research/SLASH/conf/slash_mla_1p7B_dense_32k.yaml
+#       并从 4K base 的 checkpoint resume
+# 注: 4K->32K 可断(重开 cosine); 32K->128K 必连续(见 SCALING.md §5)
+
+model_name_or_path: ./third_party/PaddleFleet/Research/SLASH/model_configs/mla_1p7B_dense_32k
+max_seq_length: 32768
+
+# batch: gbs=64 (=64卡 × per_device1 × acc1), tokens/step=2.1M
+context_parallel_size: 1
+global_batch_size: 64
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+
+# 连续 cosine (跨 32K+128K): horizon=max_steps=19000(40B合计); 32K 段训到 ~9500 步即切 128K
+lr_scheduler: cosine
+learning_rate: 1.5e-4
+min_lr: 1e-5
+warmup_steps: 200
+max_steps: 19000
+save_steps: 500
+output_dir: ./output/slash_mla_1p7B_dense_32k
+
+# 数据: 32K 长文数据 (SLASH/datas)
+data_filelist: third_party/PaddleFleet/Research/SLASH/datas/vocsize-102400-ctx-32k.zy
+data_weights: third_party/PaddleFleet/Research/SLASH/datas/vocsize-102400-ctx-32k.ratio
