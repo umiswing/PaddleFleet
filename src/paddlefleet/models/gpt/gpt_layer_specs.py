@@ -315,7 +315,10 @@ def get_attention_spec(
         # Decide attention class: always MLASelfAttention (DSA is a pluggable core_attention)
         attn_cls = MLASelfAttention
 
-        if config is not None and config.enable_hy_sparse_attention:
+        if config is not None and (
+            config.enable_hy_sparse_attention
+            or getattr(config, "use_slashmla", False)
+        ):
             attn_cls = MQASelfAttention
 
         # Gated attention
@@ -553,7 +556,10 @@ def get_gpt_layer_local_spec(
 
         transformer_cls = HyperConnectionTransformerLayer
 
-    if config is not None and config.enable_hy_sparse_attention:
+    if config is not None and (
+        config.enable_hy_sparse_attention
+        or getattr(config, "use_slashmla", False)
+    ):
         # HySparse is only implemented for the MLA-absorbed MQA attention path
         # (MQASelfAttention). HySparseTransformerLayer passes a ``shared_kv``
         # kwarg into the attention forward; a plain SelfAttention.forward has no

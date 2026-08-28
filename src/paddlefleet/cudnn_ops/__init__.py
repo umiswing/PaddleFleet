@@ -15,6 +15,7 @@
 """cuDNN frontend ops bridged into PaddleFleet."""
 
 from .attn.csa_sparse_attn_bwd_cudnn import csa_sparse_attn_bwd_cudnn
+from .attn.csa_sparse_attn_bwd_cutedsl import csa_sparse_attn_bwd_cutedsl
 from .block_sparse_mqa_dsa import (
     block_sparse_mqa_attention_dsa,
     is_dsa_available,
@@ -36,6 +37,7 @@ __all__ = [
     "block_sparse_mqa_attention_dsa",
     "csa_indexer_bwd",
     "csa_sparse_attn_bwd_cudnn",
+    "csa_sparse_attn_bwd_cutedsl",
     "cudnn_indexer_forward",
     "cudnn_indexer_topk",
     "cudnn_indexer_topk_fwd",

@@ -59,7 +59,6 @@ def flash_mla_sparse_attn(
 ):
     if _flash_mla_sparse_fwd is None:
         raise RuntimeError("flash_mla is not available")
-
     b, sq, h, d = q.shape
     _, skv, _ = kv.shape
     topk = topk_idxs.shape[-1]

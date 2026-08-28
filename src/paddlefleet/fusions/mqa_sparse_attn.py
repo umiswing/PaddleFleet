@@ -50,7 +50,8 @@ its selected block ids into token columns first.
 
 import paddle
 
-# FlashMLA's sparse prefill fixes the query-head count on SM100.
+# FlashMLA's absorbed-MQA sparse prefill uses the same fixed query-head count
+# on SM90 and SM100.
 _DSA_HEADS = 64
 # Sink logit that makes ``exp(sink - m) -> 0``, i.e. plain softmax.
 _NEG_SINK = -1e30
@@ -81,6 +82,12 @@ class _MQASparseAttention(paddle.autograd.PyLayer):
     # ``apply`` so it never outlives one call.
     _lse_indexer = None
 
+    # Side channel for ``lse_indexer``: a PyLayer's returned tensors all become
+    # autograd outputs needing a matching backward grad, and this LSE is a
+    # by-product consumed under no_grad. ``mqa_sparse_attn`` pops it right after
+    # ``apply`` so it never outlives one call.
+    _lse_indexer = None
+
     @staticmethod
     def forward(
         ctx,
@@ -92,6 +99,7 @@ class _MQASparseAttention(paddle.autograd.PyLayer):
         attn_sink=None,
         indexer_topk=0,
         sink_grad_fusion=False,
+        use_slashmla=False,
         global_kv_idx_remap_fusion=False,
         backward_backend="cudnn",
     ):
@@ -101,6 +109,7 @@ class _MQASparseAttention(paddle.autograd.PyLayer):
         from paddlefleet.fusions.csa_sparse_attn import _csa_compute_topk_length
 
         b, s, h, dk = query.shape
+        _, skv, _ = kv.shape
         ctx.num_heads = h
         ctx.d_v = d_v
         ctx.sm_scale = float(sm_scale)
@@ -112,9 +121,11 @@ class _MQASparseAttention(paddle.autograd.PyLayer):
                 f"'tilelang', got {backward_backend!r}"
             )
         ctx.backward_backend = backward_backend
+        ctx.use_slashmla = bool(use_slashmla)
 
         # Pad query heads up to the DSA-supported h_q == 64. The FlashMLA
-        # sparse backend fixes h_q at _DSA_HEADS (sink is [_DSA_HEADS]); it can
+        # sparse backend fixes h_q at _DSA_HEADS for absorbed MQA on SM90/SM100
+        # (sink is [_DSA_HEADS]); it can
         # only handle h <= _DSA_HEADS by zero-padding the head dim. h > 64 is
         # unsupported and must be rejected here rather than failing deep in the
         # CUDA op with an opaque shape error.
@@ -156,18 +167,17 @@ class _MQASparseAttention(paddle.autograd.PyLayer):
                 sink = sink_real
             sink = sink.contiguous()
 
-        # Per-query early-stop bound shared by both kernels (``mTopkLength``).
-        # ``token_indices`` is dense-width (window+topk, or the full causal
-        # width) and right-padded with ``-1``, so most rows only use a short
-        # prefix; without this the kernels scan the full width for every query.
-        # ``_csa_compute_topk_length`` returns the TRAILING bound (last valid
-        # column + 1), which stays correct when doc masking leaves interleaved
-        # ``-1`` holes, and clamps to >=1 so the backward writes every dq row
-        # (``dq`` is allocated uninitialized in the SM100 backend).
+        # Keep the indexer's token-level [B, S, K] output unchanged. The
+        # contract is a valid prefix followed by trailing -1 entries; derive
+        # the kernel loop bound from that representation without compacting or
+        # reordering the selected columns.
+        token_indices = token_indices.contiguous()
         topk_len_flat = _csa_compute_topk_length(
             token_indices.reshape([b * s, -1])
         )
+        ctx.topk_length_safe = False
 
+        out, lse, lse_indexer = flash_mla_sparse_attn(
         out, lse, lse_indexer = flash_mla_sparse_attn(
             q_pad,
             kv,
@@ -180,6 +190,7 @@ class _MQASparseAttention(paddle.autograd.PyLayer):
             global_kv_idx_remap_fusion=global_kv_idx_remap_fusion,
         )  # out [b, s, 64, d_v], lse [b, s, 64]
         _MQASparseAttention._lse_indexer = lse_indexer
+        _MQASparseAttention._lse_indexer = lse_indexer
 
         # ``token_indices`` is saved rather than recomputed so the backward always
         # differentiates the exact support the forward used. Under full recompute
@@ -189,7 +200,7 @@ class _MQASparseAttention(paddle.autograd.PyLayer):
         # over Gaussian, low-rank and heavy-tailed activations; it only churns
         # under exact score ties, which continuous q.k does not produce.
         ctx.save_for_backward(
-            q_pad, kv, out, lse, token_indices, sink, topk_len_flat
+            query, kv, out, lse, token_indices, sink, topk_len_flat
         )
         ctx.needs_grad = (
             not query.stop_gradient,
@@ -201,8 +212,15 @@ class _MQASparseAttention(paddle.autograd.PyLayer):
 
     @staticmethod
     def backward(ctx, grad_output):
+        from paddlefleet.fusions.csa_sparse_attn import (
+            _csa_bwd_honours_topk_length_holes,
+        )
+        from paddlefleet.fusions.csa_sparse_attn_utils import (
+            _local_to_global_flat,
+        )
+
         (
-            q_pad,
+            query,
             kv,
             out,
             lse,
@@ -211,10 +229,21 @@ class _MQASparseAttention(paddle.autograd.PyLayer):
             topk_len_flat,
         ) = ctx.saved_tensor()
 
-        b, s, hpad, dk = q_pad.shape
+        b, s, h, dk = query.shape
+        hpad = _DSA_HEADS
         d_v = ctx.d_v
-        h = ctx.num_heads
         _, skv, _ = kv.shape
+
+        # The forward kernel needs the DSA-fixed 64-head layout, but retaining
+        # that padded tensor in ctx would cost ~576 MiB at S=8192. Keep the
+        # original query in the autograd context and rebuild the padding only
+        # for the backward kernel. These operations run inside the custom
+        # backward and do not create a second autograd graph.
+        if h < hpad:
+            q_pad_extra = paddle.zeros([b, s, hpad - h, dk], dtype=query.dtype)
+            q_pad = paddle.concat([query, q_pad_extra], axis=2)
+        else:
+            q_pad = query
 
         # Re-pad the incoming grad back to hpad heads (padded heads get 0 grad,
         # so they contribute nothing to dq / dkv).
@@ -233,6 +262,7 @@ class _MQASparseAttention(paddle.autograd.PyLayer):
                 mqa_latent_sparse_bwd,
             )
 
+            assert ctx.use_slashmla == False
             # The tilelang backward takes the un-padded q/do/lse at the real
             # head count ``h``, and the sink as [h] (sinkless = -1e30 [hpad]
             # was built in the forward for the FlashMLA kernel, slice back).
@@ -304,6 +334,38 @@ class _MQASparseAttention(paddle.autograd.PyLayer):
                 ).astype(lse.dtype)
                 sink_bwd = paddle.full([hpad], _NEG_SINK, dtype="float32")
             lse_flat = lse_bwd.reshape([b * s, hpad])
+
+            # SM90's DSA backward kernel drops its ``-1`` guard when a
+            # topk_length bound is supplied.  The forward-side adapter has already
+            # compacted rows with interior holes; on SM90 it also disables this
+            # bound if a row is completely empty.  SM100 keeps the upstream guard
+            # and can use the bound in either representation.
+            topk_length_bwd = (
+                topk_len_flat
+                if (ctx.topk_length_safe or _csa_bwd_honours_topk_length_holes())
+                else None
+            )
+            if ctx.use_slashmla:
+                from paddlefleet.cudnn_ops import csa_sparse_attn_bwd_cutedsl
+
+                dq_flat, dkv_flat, _d_sink_unused = csa_sparse_attn_bwd_cutedsl(
+                    q_flat,
+                    kv_flat,
+                    o_flat,
+                    do_flat,
+                    lse_flat,
+                    sink_bwd,
+                    gidx_flat,
+                    softmax_scale=ctx.sm_scale,
+                    topk_length=topk_length_bwd,
+                    # Sink gradients are computed analytically below.  Do not ask
+                    # the CuTeDSL kernel to produce d_sink, especially for the
+                    # sinkless SlashMLA path.
+                    need_d_sink=False,
+                )
+            else:
+                from paddlefleet.cudnn_ops import csa_sparse_attn_bwd_cudnn
+
 
             # DSA passes topk_length=None (the guarded, full-width backward path)
             # rather than compacting. Its ``[top-k | window]`` layout carries
@@ -417,6 +479,7 @@ def mqa_sparse_attn(
     attn_sink=None,
     indexer_topk=0,
     sink_grad_fusion=False,
+    use_slashmla=False,
     global_kv_idx_remap_fusion=False,
     backward_backend="cudnn",
 ):
@@ -451,6 +514,8 @@ def mqa_sparse_attn(
                        backward instead of the eager elementwise chain.
                        Bit-identical either way; wired from the
                        ``sparse_attn_global_kv_idx_remap_fusion`` config field.
+        use_slashmla: select the SM90 CuTeDSL DSA backward used by SlashMLA.
+                       Other callers keep the cuDNN DSA backward by default.
         backward_backend: ``"cudnn"`` (default, fast, non-deterministic dkv) or
                        ``"tilelang"`` (deterministic, ~14x slower on SM100).
 
@@ -467,6 +532,7 @@ def mqa_sparse_attn(
         attn_sink,
         int(indexer_topk),
         sink_grad_fusion,
+        bool(use_slashmla),
         global_kv_idx_remap_fusion,
         str(backward_backend),
     )

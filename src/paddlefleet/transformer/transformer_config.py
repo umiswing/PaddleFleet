@@ -1287,6 +1287,35 @@ class TransformerConfig(ModelParallelConfig):
     with num_chunks=N. Only compatible with tensor_model_parallel_size == 1
     (or parallel_output disabled)."""
 
+    use_slashmla: bool = False
+    """Enable token-sparse absorbed MLA on the SlashMLA path."""
+
+    use_slashmla_hca: bool = True
+    """Enable the hierarchical HCA branch inside SlashMLA.
+
+    When ``True`` (the default), SlashMLA runs HCA+SparseMLA and uses the
+    ``slashmla_hca_*`` settings. When ``False``, it runs the plain token-top-k
+    SparseMLA path and does not construct or execute the HCA compressor.
+    """
+
+    slashmla_dim: int | None = None
+    """Leading absorbed Q/K width used by the SlashMLA indexer."""
+
+    slashmla_topk: int = 1024
+    """Number of token columns selected per query by SlashMLA."""
+
+    slashmla_hca_ratio: int = 128
+    """Compression ratio used by the SlashMLA hierarchical indexer."""
+
+    slashmla_hca_block_topk: int = 16
+    """Number of compressed blocks retained by the indexer."""
+
+    slashmla_hca_alpha: float = 1.0
+    """Multiplier for the sparse MLA branch."""
+
+    slashmla_hca_query_chunk_size: int = 128
+    """Query chunk size used by the SlashMLA indexer."""
+
     enable_hy_sparse_attention: bool = False
     """Enable the HySparse Attention variant.
 
@@ -2775,6 +2804,35 @@ class TransformerConfig(ModelParallelConfig):
         # block_B == 64 (one block == one TopK tile chunk). Other values either
         # silently mis-bucket keys or fail deep in the CUDA kernels, so reject
         # them up front.
+        if self.use_slashmla:
+            if self.slashmla_dim is None or self.slashmla_dim <= 0:
+                raise ValueError(
+                    "use_slashmla requires slashmla_dim to be positive."
+                )
+            if self.slashmla_topk <= 0:
+                raise ValueError("slashmla_topk must be positive.")
+            if self.use_slashmla_hca:
+                if self.slashmla_hca_ratio != 128:
+                    raise ValueError(
+                        "SlashMLA HCA requires slashmla_hca_ratio=128."
+                    )
+                if self.slashmla_hca_block_topk <= 0:
+                    raise ValueError(
+                        "slashmla_hca_block_topk must be positive."
+                    )
+                if self.slashmla_hca_query_chunk_size <= 0:
+                    raise ValueError(
+                        "slashmla_hca_query_chunk_size must be positive."
+                    )
+            if self.tensor_model_parallel_size != 1:
+                raise ValueError(
+                    "use_slashmla requires tensor_model_parallel_size=1."
+                )
+            if self.sequence_parallel:
+                raise ValueError(
+                    "use_slashmla does not support sequence_parallel."
+                )
+
         if self.enable_hy_sparse_attention and self.hy_sparse_block_size != 64:
             raise ValueError(
                 "hy_sparse_block_size must be 64 when enable_hy_sparse_attention "

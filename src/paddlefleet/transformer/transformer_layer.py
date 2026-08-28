@@ -2055,15 +2055,32 @@ class HySparseTransformerLayer(TransformerLayer):
                 shared_block_indices=dict_args.get(
                     "shared_block_indices", None
                 ),
+                shared_token_indices=dict_args.get(
+                    "shared_token_indices", None
+                ),
+                shared_slash_offsets=dict_args.get(
+                    "shared_slash_offsets", None
+                ),
                 **offload_kwargs,
             )
         else:
             outputs = self._forward_impl(**dict_args)
 
         if isinstance(outputs, tuple):
-            output, shared_key, shared_block_indices = outputs
+            if len(outputs) == 5:
+                (
+                    output,
+                    shared_key,
+                    shared_block_indices,
+                    shared_token_indices,
+                    shared_slash_offsets,
+                ) = outputs
+            else:
+                output, shared_key, shared_block_indices = outputs
+                shared_token_indices, shared_slash_offsets = None, None
         else:
             output, shared_key, shared_block_indices = outputs, None, None
+            shared_token_indices, shared_slash_offsets = None, None
 
         rst = OrderedDict()
         rst = {"hidden_states": output}
@@ -2075,6 +2092,9 @@ class HySparseTransformerLayer(TransformerLayer):
         if shared_key is not None:
             rst["shared_key"] = shared_key
             rst["shared_block_indices"] = shared_block_indices
+            if shared_token_indices is not None:
+                rst["shared_token_indices"] = shared_token_indices
+                rst["shared_slash_offsets"] = shared_slash_offsets
         rst = {**dict_args, **rst}
         return rst
 
@@ -2097,6 +2117,8 @@ class HySparseTransformerLayer(TransformerLayer):
         input_ids: Tensor | None = None,
         shared_key: Tensor | None = None,
         shared_block_indices: Tensor | None = None,
+        shared_token_indices: Tensor | None = None,
+        shared_slash_offsets: Tensor | None = None,
         origin_input_ids: Tensor | None = None,
         **kwargs,
     ):
@@ -2105,8 +2127,24 @@ class HySparseTransformerLayer(TransformerLayer):
         # 使用统一的 shared_kv 参数处理输入输出:
         # 1. 对于 swa 层是输入, 只消费 shared_kv，不生产;
         # 2. 对于 full 层是输出, 只生产 shared_kv, 不消费.
+        use_slashmla = getattr(self.config, "use_slashmla", False)
         if self.self_attn.is_swa:
-            if shared_key is None or shared_block_indices is None:
+            if use_slashmla:
+                if (
+                    shared_key is None
+                    or shared_token_indices is None
+                    or shared_slash_offsets is None
+                ):
+                    raise ValueError(
+                        "SlashMLA SWA layer requires shared latent KV, "
+                        "token indices, and offsets."
+                    )
+                shared_kv = [
+                    shared_key,
+                    shared_token_indices,
+                    shared_slash_offsets,
+                ]
+            elif shared_key is None or shared_block_indices is None:
                 raise ValueError(
                     f"HySparse SWA layer (layer_number={self.layer_number}) "
                     "requires shared KV latent and top-k block indices from a "
@@ -2116,7 +2154,8 @@ class HySparseTransformerLayer(TransformerLayer):
                     "state -- e.g. set window_attn_skip_freq so that layer 0 "
                     "is full attention rather than SWA."
                 )
-            shared_kv = [shared_key, shared_block_indices]
+            if not use_slashmla:
+                shared_kv = [shared_key, shared_block_indices]
         else:
             shared_kv = []
 
@@ -2155,6 +2194,19 @@ class HySparseTransformerLayer(TransformerLayer):
         self._log_md5(output, "layer_output", self.layer_number)
 
         if (not self.self_attn.is_swa) and shared_kv:
+            if use_slashmla:
+                (
+                    shared_key,
+                    shared_token_indices,
+                    shared_slash_offsets,
+                ) = shared_kv
+                return (
+                    output,
+                    shared_key,
+                    None,
+                    shared_token_indices,
+                    shared_slash_offsets,
+                )
             shared_key, shared_block_indices = shared_kv
             if self.training and not paddle.is_grad_enabled():
                 shared_key.stop_gradient = False

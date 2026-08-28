@@ -2333,9 +2333,23 @@ class MQASelfAttention(MLASelfAttention):
             "MQA does not support rope fusion."
         )
 
-        # Use MQA only when HySparse is enabled and this is an SWA layer.
-        # Otherwise, use its parent's forward method (MLA).
-        self.is_mqa = config.enable_hy_sparse_attention and self.is_swa
+        # SlashMLA uses absorbed MQA for both full and SWA layers. HySparse
+        # keeps the legacy MQA path limited to SWA consumer layers.
+        self.use_slashmla = getattr(config, "use_slashmla", False)
+        self.use_slashmla_hca = getattr(config, "use_slashmla_hca", True)
+        self.slashmla_hca_compressor = None
+        if self.use_slashmla and self.use_slashmla_hca:
+            from paddlefleet.transformer.slash_mla import (
+                SlashMLAHCACompressor,
+            )
+
+            self.slashmla_hca_compressor = SlashMLAHCACompressor(
+                self.config.kv_lora_rank + self.qk_rope_head_dim,
+                ratio=self.config.slashmla_hca_ratio,
+            )
+        self.is_mqa = self.use_slashmla or (
+            config.enable_hy_sparse_attention and self.is_swa
+        )
 
         if self.is_mqa:
             # Adjust absorbed kv channels for core attention
@@ -2423,6 +2437,110 @@ class MQASelfAttention(MLASelfAttention):
                     default_initializer=paddle.nn.initializer.Constant(0.0),
                 )
 
+    def _forward_slashmla_sparse(
+        self,
+        hidden_states,
+        query,
+        key,
+        q_compressed,
+        shared_kv,
+        attn_mask_startend_row_indices,
+        in_recompute,
+        layer_num,
+    ):
+        """Run full/token-top-k SlashMLA without the HySparse SWA path."""
+        from paddlefleet.transformer.slash_mla import (
+            slashmla_hca_sparse_attention,
+            slashmla_sparse_attention,
+            slashmla_topk,
+        )
+        from paddlefleet.transformer.transformer_layer import TransformerLayer
+
+        # Full SlashMLA owns the current layer's latent KV. A future SWA
+        # consumer may pass the producer's shared state, but full attention
+        # must remain runnable with the normal empty shared_kv list.
+        if shared_kv is not None and len(shared_kv) == 3:
+            shared_key = shared_kv[0]
+        else:
+            shared_key = key
+        if get_context_parallel_world_size() > 1:
+            cp_mode = getattr(
+                self.config, "cp_balance_mode", "dualchunk_allgather"
+            )
+            shared_key = ContextParallelAllGatherOp.apply(
+                shared_key, 1, cp_mode
+            )
+
+        kv_lora_rank = self.config.kv_lora_rank
+        num_heads = self.num_attention_heads_per_partition
+        v_absorb_weight = self.kv_b_proj.weight.reshape(
+            [kv_lora_rank, num_heads, -1]
+        )[:, :, self.qk_nope_head_dim :]
+        value_weight = v_absorb_weight.transpose([1, 0, 2])
+
+        if self.use_slashmla_hca:
+            sparse_core_attn_out, _ = slashmla_hca_sparse_attention(
+                query,
+                shared_key,
+                value_weight,
+                self.slashmla_hca_compressor,
+                self.config.slashmla_topk,
+                self.config.slashmla_dim,
+                self.config.slashmla_hca_block_topk,
+                self.softmax_scale,
+                kv_lora_rank,
+                self.v_head_dim,
+                mask=attn_mask_startend_row_indices,
+                alpha=self.config.slashmla_hca_alpha,
+                query_chunk_size=self.config.slashmla_hca_query_chunk_size,
+                attn_sink=getattr(self, "sparse_attn_sink", None),
+            )
+        else:
+            latent_key = (
+                shared_key.squeeze(2) if shared_key.ndim == 4 else shared_key
+            )
+            token_indices = slashmla_topk(
+                query,
+                latent_key,
+                self.config.slashmla_topk,
+                self.config.slashmla_dim,
+                mask=attn_mask_startend_row_indices,
+            )
+            sparse_core_attn_out = slashmla_sparse_attention(
+                query,
+                shared_key,
+                value_weight,
+                token_indices,
+                self.softmax_scale,
+                kv_lora_rank,
+                self.v_head_dim,
+                attn_sink=getattr(self, "sparse_attn_sink", None),
+            )
+
+        if self.use_vha_postmix:
+            if (
+                self.recompute_vha_postmix
+                and self.training
+                and not in_recompute
+            ):
+                sparse_core_attn_out = recompute(
+                    self._apply_vha_postmix, sparse_core_attn_out
+                )
+            else:
+                sparse_core_attn_out = self._apply_vha_postmix(
+                    sparse_core_attn_out
+                )
+
+        if self.gated_attention:
+            gate_source = (
+                q_compressed if self.gated_attn_use_q_lora else hidden_states
+            )
+            sparse_core_attn_out = self._gate(gate_source, sparse_core_attn_out)
+
+        output, bias = self.o_proj(sparse_core_attn_out)
+        TransformerLayer._log_md5(output, "attn_o_proj_out", layer_num)
+        return output, bias
+
     def forward(
         self,
         hidden_states,
@@ -2455,6 +2573,7 @@ class MQASelfAttention(MLASelfAttention):
         )
         if get_pg_size(self.pg_collection.tp) != 1:
             raise ValueError("MQA does not support tensor parallel.")
+        use_slashmla = self.use_slashmla
 
         if not self.is_mqa:
             return super().forward(
@@ -2495,6 +2614,18 @@ class MQASelfAttention(MLASelfAttention):
 
         if value is not None:
             value = value.contiguous()
+
+        if use_slashmla:
+            return self._forward_slashmla_sparse(
+                hidden_states=hidden_states,
+                query=query,
+                key=key,
+                q_compressed=q_compressed,
+                shared_kv=shared_kv,
+                attn_mask_startend_row_indices=attn_mask_startend_row_indices,
+                in_recompute=in_recompute,
+                layer_num=layer_num,
+            )
 
         if get_context_parallel_world_size() > 1:
             cp_mode = getattr(
