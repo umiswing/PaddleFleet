@@ -10,22 +10,31 @@ keeps its token-level routing contract, but scores the absorbed MLA query
 against the shared latent key and uses the absorbed-MQA sparse backend for the
 actual attention.
 
-The indexer is deliberately kept behind small function boundaries. The legacy
-TileLang implementation returns token-level indices directly, while the
-HCA+MLA path uses a no-grad Paddle hierarchical indexer: compressed-block
-coarse top-k followed by token-level fine top-k inside the selected blocks.
+The indexer is deliberately kept behind small function boundaries, and each
+boundary picks exactly one kernel per GPU architecture -- there are no silent
+Paddle fallbacks.  An unsupported device or a missing optional extension raises
+instead of quietly running a different (much slower, numerically different)
+implementation:
+
+* plain token top-k: the legacy CuTeDSL two-stage indexer on SM90, the TileLang
+  indexer on SM100+;
+* HCA coarse stage: the TileLang CSA block indexer on every architecture;
+* HCA fine stage: the SM90 cp.async/WGMMA score kernel on SM90, the TileLang
+  fine-score kernel on SM100+.
 """
 
 from __future__ import annotations
 
-import os
-import warnings
-
 import paddle
 
 
-def _is_slashmla_flash_mla_available() -> bool:
-    """Whether the FlashMLA sparse forward kernel is available.
+def _device_major() -> int:
+    """Compute-capability major number of the current CUDA device."""
+    return int(paddle.device.cuda.get_device_capability()[0])
+
+
+def _require_slashmla_flash_mla() -> None:
+    """Raise unless the FlashMLA sparse forward kernel is usable.
 
     SlashMLA uses the local CuTeDSL backward on SM90, so it must not reuse
     ``is_dsa_available``: that helper deliberately requires SM100+ and also
@@ -37,14 +46,20 @@ def _is_slashmla_flash_mla_available() -> bool:
 
         from paddlefleet.cudnn_ops.attn import csa_sparse_attn_fwd_cudnn
 
-        if (
-            not paddlefleet_ops.is_flash_mla_available()
-            or csa_sparse_attn_fwd_cudnn._flash_mla_sparse_fwd is None
-        ):
-            return False
-    except (ImportError, RuntimeError, AttributeError):
-        return False
-    return True
+        available = (
+            paddlefleet_ops.is_flash_mla_available()
+            and csa_sparse_attn_fwd_cudnn._flash_mla_sparse_fwd is not None
+        )
+    except (ImportError, RuntimeError, AttributeError) as exc:
+        raise RuntimeError(
+            "SlashMLA requires the FlashMLA sparse forward kernel from "
+            "paddlefleet_ops, which could not be imported."
+        ) from exc
+    if not available:
+        raise RuntimeError(
+            "SlashMLA requires the FlashMLA sparse forward kernel, but it is "
+            "unavailable on this device."
+        )
 
 
 class SlashMLAHCACompressor(paddle.nn.Layer):
@@ -121,13 +136,6 @@ class SlashMLAHCACompressor(paddle.nn.Layer):
         )
         compressed = (block_tokens.cast(weights.dtype) * weights).sum(axis=2)
         return compressed.cast(token_kv.dtype), block_starts
-
-
-def _env_enabled(name, default=False):
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.lower() in {"1", "true", "yes", "on"}
 
 
 def _document_metadata(mask, batch_size, seq_len):
@@ -267,46 +275,6 @@ def _validate_valid_range(valid_range, batch_size, seq_len, key_len):
         )
 
 
-def _paddle_topk(query, key, topk, valid_range, chunk_size=512):
-    """Memory-bounded token top-k fallback.
-
-    ``query`` is [B, S, H, D] and ``key`` is [B, S, D].  The head-wise
-    selection is reduced with max, matching the shared-token routing semantics
-    needed by the downstream SWA layers.
-    """
-    b, sq, _, dim = query.shape
-    sk = key.shape[1]
-    k = min(int(topk), sk)
-    q = query.transpose([0, 2, 1, 3]).cast("float32")
-    best_scores = paddle.full([b, sq, k], -float("inf"), dtype="float32")
-    best_indices = paddle.full([b, sq, k], -1, dtype="int32")
-    ranges = valid_range.cast("int64")
-    for start in range(0, sk, chunk_size):
-        end = min(start + chunk_size, sk)
-        scores = paddle.matmul(
-            q,
-            key[:, start:end, :]
-            .cast("float32")
-            .transpose([0, 2, 1])
-            .unsqueeze(1),
-        ).max(axis=1)
-        columns = paddle.arange(start, end, dtype="int64").reshape([1, 1, -1])
-        columns = columns.expand([b, sq, end - start])
-        allowed = (columns >= ranges[:, :, 0:1]) & (columns < ranges[:, :, 1:2])
-        scores = paddle.where(
-            allowed, scores, paddle.full_like(scores, -float("inf"))
-        )
-        merged_scores = paddle.concat([best_scores, scores], axis=-1)
-        merged_indices = paddle.concat(
-            [best_indices.cast("int64"), columns], axis=-1
-        )
-        best_scores, positions = paddle.topk(merged_scores, k=k, axis=-1)
-        best_indices = paddle.take_along_axis(
-            merged_indices, positions, axis=-1
-        ).cast("int32")
-    return best_indices
-
-
 def _next_power_of_two(value):
     result = 1
     while result < value:
@@ -396,6 +364,20 @@ def _cutedsl_topk(query, key, topk, valid_range):
     ).cast("int32")
 
 
+def _tilelang_topk(query, key, topk, valid_range):
+    """Run the TileLang token indexer used on SM100+."""
+    from paddlefleet.tilelang_ops.indexer.slashmla_indexer import (
+        slashmla_tilelang_topk,
+    )
+
+    return slashmla_tilelang_topk(
+        query,
+        key,
+        min(int(topk), int(key.shape[1])),
+        valid_range,
+    )
+
+
 def slashmla_topk(query, key, topk, slash_dim, mask=None):
     """Compute token-level [B, S, K] indices for absorbed MLA."""
     if query.ndim != 4 or key.ndim != 3:
@@ -430,55 +412,19 @@ def slashmla_topk(query, key, topk, slash_dim, mask=None):
         int(key.shape[1]),
     )
 
-    backend = os.environ.get(
-        "FLEET_SLASHMLA_INDEXER",
-        os.environ.get("FLEET_SLASH_INDEXER", "cutedsl"),
-    ).lower()
-    if backend == "cutedsl":
-        try:
-            result = _cutedsl_topk(query, key, topk, valid_range)
-        except (ImportError, ModuleNotFoundError, RuntimeError) as exc:
-            if not _env_enabled("FLEET_SLASHMLA_CUTEDSL_FALLBACK", True):
-                raise RuntimeError(
-                    "SlashMLA CuTeDSL indexer is unavailable. It requires the "
-                    "CuTe DSL/cuda/cutlass runtime on an SM90 device; set "
-                    "FLEET_SLASHMLA_CUTEDSL_FALLBACK=1 to use Paddle fallback."
-                ) from exc
-            warnings.warn(
-                "SlashMLA CuTeDSL indexer unavailable; falling back to Paddle: "
-                f"{exc}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            raise RuntimeError("SlashMLA CuTeDSL fallback not implemented")
-        return result
-    if backend == "tilelang":
-        try:
-            from paddlefleet.tilelang_ops.indexer.slashmla_indexer import (
-                slashmla_tilelang_topk,
-            )
-
-            return slashmla_tilelang_topk(
-                query,
-                key,
-                min(int(topk), key.shape[1]),
-                valid_range,
-            )
-        except (
-            ImportError,
-            ModuleNotFoundError,
-            RuntimeError,
-            NotImplementedError,
-        ):
-            # The fallback is useful for correctness tests and for machines
-            # where the optional TileLang extension was not built.
-            pass
-    elif backend != "paddle":
-        raise ValueError(
-            "FLEET_SLASHMLA_INDEXER must be 'tilelang', 'cutedsl', or "
-            f"'paddle', got {backend!r}."
-        )
-    return _paddle_topk(query, key, topk, valid_range)
+    # One indexer per architecture, no fallback: the legacy CuTeDSL two-stage
+    # kernel is Hopper-only, and the TileLang indexer is what SM100+ uses. Both
+    # were verified to select the same token set, so this is a kernel choice and
+    # not a semantic switch.
+    major = _device_major()
+    if major == 9:
+        return _cutedsl_topk(query, key, topk, valid_range)
+    if major >= 10:
+        return _tilelang_topk(query, key, topk, valid_range)
+    raise RuntimeError(
+        "SlashMLA token indexer requires SM90 (CuTeDSL two-stage indexer) or "
+        f"SM100+ (TileLang indexer); got compute capability major {major}."
+    )
 
 
 def slashmla_hca_topk(
@@ -517,13 +463,14 @@ def slashmla_hca_topk(
             valid_range=valid_range,
             slash_dim=slash_dim,
             query_chunk_size=query_chunk_size,
+            # The coarse stage is TileLang on every architecture. The fine stage
+            # has one kernel per architecture: the SM90 cp.async/WGMMA score
+            # kernel on Hopper, the TileLang fine-score kernel on SM100+.
             stage1_backend=(
-                os.environ.get("FLEET_SLASHMLA_HCA_STAGE1", "tilelang")
-                if stage1_backend is None
-                else stage1_backend
+                "tilelang" if stage1_backend is None else stage1_backend
             ),
             fine_backend=(
-                os.environ.get("FLEET_SLASHMLA_HCA_FINE", "paddle")
+                _default_hca_fine_backend()
                 if fine_backend is None
                 else fine_backend
             ),
@@ -532,235 +479,18 @@ def slashmla_hca_topk(
     return result
 
 
-def _slashmla_hca_topk_impl(
-    query,
-    token_key,
-    compressed_key,
-    block_starts,
-    topk,
-    slash_dim,
-    block_topk,
-    ratio,
-    mask,
-    query_chunk_size,
-):
-    if query.ndim != 4 or token_key.ndim != 3 or compressed_key.ndim != 3:
-        raise ValueError(
-            "SlashMLA HCA indexer expects query [B,S,H,D], token key [B,S,D], "
-            "and compressed key [B,C,D]."
-        )
-    b, sq, _, query_dim = [int(x) for x in query.shape]
-    if int(token_key.shape[0]) != b or int(compressed_key.shape[0]) != b:
-        raise ValueError("SlashMLA HCA indexer inputs must share batch size.")
-    if int(token_key.shape[1]) != sq:
-        raise ValueError(
-            "SlashMLA HCA indexer requires query/token-key lengths to match, "
-            f"got {sq} and {token_key.shape[1]}."
-        )
-    select_dim = int(slash_dim)
-    if (
-        select_dim <= 0
-        or select_dim > query_dim
-        or select_dim > int(token_key.shape[-1])
-        or select_dim > int(compressed_key.shape[-1])
-    ):
-        raise ValueError(
-            "slash_dim must be positive and fit query/token/compressed widths, "
-            f"got {select_dim}."
-        )
-    ratio = int(ratio)
-    block_topk = int(block_topk)
-    requested_topk = int(topk)
-    query_chunk_size = int(query_chunk_size)
-    if ratio <= 0 or block_topk <= 0 or requested_topk <= 0:
-        raise ValueError("ratio, block_topk, and topk must all be positive.")
-    if query_chunk_size <= 0:
-        raise ValueError("query_chunk_size must be positive.")
-
-    n_blocks = int(compressed_key.shape[1])
-    if list(block_starts.shape) != [b, n_blocks]:
-        raise ValueError(
-            "SlashMLA HCA block_starts must have shape "
-            f"[{b}, {n_blocks}], got {list(block_starts.shape)}."
-        )
-
-    q_index = query[..., :select_dim].cast("float32")
-    token_index_key = token_key[..., :select_dim].cast("float32")
-    compressed_index_key = compressed_key[..., :select_dim].cast("float32")
-    valid_range = _valid_range(mask, b, sq).cast("int64")
-    block_starts_i64 = block_starts.cast("int64")
-    block_ends = block_starts_i64 + ratio
-    offsets = paddle.arange(ratio, dtype="int64")
-    result_chunks = []
-
-    for q_start in range(0, sq, query_chunk_size):
-        q_end = min(q_start + query_chunk_size, sq)
-        q_chunk = q_index[:, q_start:q_end]
-        chunk_len = q_end - q_start
-        ranges = valid_range[:, q_start:q_end]
-        query_positions = paddle.arange(q_start, q_end, dtype="int64").reshape(
-            [1, chunk_len, 1]
-        )
-
-        if n_blocks > 0:
-            coarse_scores = paddle.einsum(
-                "bqhd,bcd->bqhc", q_chunk, compressed_index_key
-            ).sum(axis=2)
-            coarse_valid = (
-                (
-                    block_starts_i64.reshape([b, 1, n_blocks])
-                    >= ranges[:, :, 0:1]
-                )
-                & (block_ends.reshape([b, 1, n_blocks]) <= query_positions + 1)
-                & (block_starts_i64.reshape([b, 1, n_blocks]) >= 0)
-            )
-            coarse_scores = paddle.where(
-                coarse_valid,
-                coarse_scores,
-                paddle.full_like(coarse_scores, -1.0e30),
-            )
-            coarse_k = min(block_topk, n_blocks)
-            coarse_values, coarse_indices = paddle.topk(
-                coarse_scores, k=coarse_k, axis=-1
-            )
-            coarse_indices = paddle.where(
-                coarse_values > -1.0e20,
-                coarse_indices,
-                paddle.full_like(coarse_indices, -1),
-            )
-            safe_block_indices = coarse_indices.clip(0, max(n_blocks - 1, 0))
-            starts_table = block_starts_i64.unsqueeze(1).expand(
-                [b, chunk_len, n_blocks]
-            )
-            selected_starts = paddle.take_along_axis(
-                starts_table, safe_block_indices, axis=2
-            )
-            selected_starts = paddle.where(
-                coarse_indices >= 0,
-                selected_starts,
-                paddle.full_like(selected_starts, -1),
-            )
-        else:
-            selected_starts = paddle.empty([b, chunk_len, 0], dtype="int64")
-
-        # Keep the current partial block as a fine candidate. HCA only has
-        # completed blocks, but SparseMLA must still serve early/current tokens.
-        doc_start = ranges[:, :, 0]
-        query_pos_2d = query_positions.squeeze(-1).expand([b, chunk_len])
-        current_start = (
-            doc_start + ((query_pos_2d - doc_start) // ratio) * ratio
-        )
-        current_is_duplicate = (
-            (selected_starts == current_start.unsqueeze(-1)).any(axis=-1)
-            if int(selected_starts.shape[-1]) > 0
-            else paddle.zeros([b, chunk_len], dtype="bool")
-        )
-        selected_candidates = selected_starts.unsqueeze(-1) + offsets.reshape(
-            [1, 1, 1, ratio]
-        )
-        selected_candidates = paddle.where(
-            selected_starts.unsqueeze(-1) >= 0,
-            selected_candidates,
-            paddle.full_like(selected_candidates, -1),
-        ).reshape([b, chunk_len, -1])
-        current_candidates = current_start.unsqueeze(-1) + offsets.reshape(
-            [1, 1, ratio]
-        )
-        current_candidates = paddle.where(
-            current_is_duplicate.unsqueeze(-1),
-            paddle.full_like(current_candidates, -1),
-            current_candidates,
-        )
-        candidates = paddle.concat(
-            [selected_candidates, current_candidates], axis=-1
-        )
-        candidate_valid = (
-            (candidates >= ranges[:, :, 0:1])
-            & (candidates < ranges[:, :, 1:2])
-            & (candidates >= 0)
-            & (candidates < int(token_key.shape[1]))
-        )
-        candidates = paddle.where(
-            candidate_valid, candidates, paddle.full_like(candidates, -1)
-        )
-
-        gathered_key = _batched_gather_tokens(token_index_key, candidates)
-        fine_scores = paddle.einsum(
-            "bqhd,bqnd->bqhn", q_chunk, gathered_key
-        ).sum(axis=2)
-        fine_scores = paddle.where(
-            candidate_valid,
-            fine_scores,
-            paddle.full_like(fine_scores, -1.0e30),
-        )
-        fine_k = min(requested_topk, int(candidates.shape[-1]))
-        fine_values, fine_positions = paddle.topk(
-            fine_scores, k=fine_k, axis=-1
-        )
-        fine_indices = paddle.take_along_axis(
-            candidates, fine_positions, axis=-1
-        )
-        fine_indices = paddle.where(
-            fine_values > -1.0e20,
-            fine_indices,
-            paddle.full_like(fine_indices, -1),
-        )
-        result_chunks.append(fine_indices.cast("int32"))
-
-    return paddle.concat(result_chunks, axis=1)
-
-
-def _paddle_hca_attention(
-    query,
-    compressed_key,
-    block_starts,
-    ratio,
-    mask,
-    sm_scale,
-    kv_lora_rank,
-    query_chunk_size=128,
-):
-    """Causal attention over completed HCA blocks using Paddle operators."""
-    b, sq, h, _ = [int(x) for x in query.shape]
-    n_blocks = int(compressed_key.shape[1])
-    if n_blocks == 0:
-        return paddle.zeros([b, sq, h, int(kv_lora_rank)], dtype=query.dtype)
-
-    valid_range = _valid_range(mask, b, sq).cast("int64")
-    starts = block_starts.cast("int64")
-    ends = starts + int(ratio)
-    compressed_f32 = compressed_key.cast("float32")
-    compressed_value = compressed_f32[..., : int(kv_lora_rank)]
-    outputs = []
-
-    for q_start in range(0, sq, int(query_chunk_size)):
-        q_end = min(q_start + int(query_chunk_size), sq)
-        chunk_len = q_end - q_start
-        q_chunk = query[:, q_start:q_end].cast("float32")
-        scores = paddle.einsum(
-            "bqhd,bcd->bqhc", q_chunk, compressed_f32
-        ) * float(sm_scale)
-        ranges = valid_range[:, q_start:q_end]
-        query_positions = paddle.arange(q_start, q_end, dtype="int64").reshape(
-            [1, chunk_len, 1]
-        )
-        valid_blocks = (
-            (starts.reshape([b, 1, n_blocks]) >= ranges[:, :, 0:1])
-            & (ends.reshape([b, 1, n_blocks]) <= query_positions + 1)
-            & (starts.reshape([b, 1, n_blocks]) >= 0)
-        )
-        scores = paddle.where(
-            valid_blocks.unsqueeze(2),
-            scores,
-            paddle.full_like(scores, -1.0e30),
-        )
-        weights = paddle.nn.functional.softmax(scores, axis=-1)
-        weights = weights * valid_blocks.unsqueeze(2).cast(weights.dtype)
-        latent_output = paddle.einsum(
-            "bqhc,bcr->bqhr", weights, compressed_value
-        )
-        outputs.append(latent_output.cast(query.dtype))
-    return paddle.concat(outputs, axis=1)
+def _default_hca_fine_backend():
+    """Pick the HCA stage-2 score kernel for the current architecture."""
+    major = _device_major()
+    if major == 9:
+        return "cutedsl"
+    if major >= 10:
+        return "tilelang"
+    raise RuntimeError(
+        "SlashMLA HCA stage-2 requires SM90 (CuTeDSL cp.async score kernel) "
+        f"or SM100+ (TileLang fine score); got compute capability major "
+        f"{major}."
+    )
 
 
 def _hca_compressed_indices(block_starts, ratio, mask, batch_size, seq_len):
@@ -811,7 +541,6 @@ def _csa_hca_attention(
     mask,
     sm_scale,
     kv_lora_rank,
-    query_chunk_size=128,
 ):
     """Run HCA attention through the CSA FlashMLA/DSA attention pair.
 
@@ -836,41 +565,7 @@ def _csa_hca_attention(
         b,
         sq,
     )
-    requested_backend = os.environ.get("FLEET_SLASHMLA_BACKEND", "auto").lower()
-    if requested_backend not in {"auto", "cudnn", "paddle"}:
-        raise ValueError(
-            "FLEET_SLASHMLA_BACKEND must be 'auto', 'cudnn', or 'paddle', "
-            f"got {requested_backend!r}."
-        )
-
-    use_fallback = requested_backend == "paddle"
-    flash_mla_available = None
-    if not use_fallback:
-        try:
-            flash_mla_available = _is_slashmla_flash_mla_available()
-            if requested_backend == "cudnn" and not flash_mla_available:
-                raise RuntimeError(
-                    "FLEET_SLASHMLA_BACKEND=cudnn requires the FlashMLA "
-                    "sparse forward kernel, but it is unavailable on this "
-                    "device."
-                )
-            use_fallback = not flash_mla_available
-        except (ImportError, RuntimeError):
-            if requested_backend == "cudnn":
-                raise
-            use_fallback = True
-
-    if use_fallback:
-        return _paddle_hca_attention(
-            query,
-            compressed_key,
-            block_starts,
-            ratio,
-            mask,
-            sm_scale,
-            kv_lora_rank,
-            query_chunk_size=query_chunk_size,
-        )
+    _require_slashmla_flash_mla()
 
     from paddlefleet.fusions.mqa_sparse_attn import mqa_sparse_attn
 
@@ -893,37 +588,6 @@ def _deabsorb_value(latent_output, value_weight, value_dim):
     return out.reshape([b, s, h * value_dim])
 
 
-def _paddle_sparse_attention(
-    query, latent_key, token_indices, sm_scale, value_dim
-):
-    """Autograd-safe token gather fallback for non-SM100 machines."""
-    b, s, h, _ = query.shape
-    k = token_indices.shape[-1]
-    safe_indices = token_indices.cast("int64").clip(0, latent_key.shape[1] - 1)
-    key_for_gather = latent_key.unsqueeze(1).expand(
-        [b, s, latent_key.shape[1], latent_key.shape[2]]
-    )
-    gathered = paddle.take_along_axis(
-        key_for_gather,
-        safe_indices.unsqueeze(-1).expand([b, s, k, latent_key.shape[2]]),
-        axis=2,
-    )
-    valid = token_indices >= 0
-    logits = paddle.einsum("bshd,bskd->bhsk", query, gathered)
-    logits = logits * float(sm_scale)
-    logits = paddle.where(
-        valid.unsqueeze(1), logits, paddle.full_like(logits, -float("inf"))
-    )
-    weights = paddle.nn.functional.softmax(logits, axis=-1)
-    weights = paddle.where(
-        valid.unsqueeze(1), weights, paddle.zeros_like(weights)
-    )
-    latent_output = paddle.einsum(
-        "bhsk,bskd->bshd", weights, gathered[..., :value_dim]
-    )
-    return latent_output
-
-
 def slashmla_sparse_attention(
     query,
     shared_key,
@@ -938,54 +602,19 @@ def slashmla_sparse_attention(
     latent_key = shared_key.squeeze(2) if shared_key.ndim == 4 else shared_key
     token_indices = topk_indices.clone()
     token_indices.stop_gradient = True
-    requested_backend = os.environ.get(
-        "FLEET_SLASHMLA_BACKEND", "cudnn"
-    ).lower()
-    if requested_backend not in {"auto", "cudnn", "paddle"}:
-        raise ValueError(
-            "FLEET_SLASHMLA_BACKEND must be 'auto', 'cudnn', or 'paddle', "
-            f"got {requested_backend!r}."
-        )
-    use_fallback = requested_backend == "paddle"
-    flash_mla_available = None
-    try:
-        flash_mla_available = _is_slashmla_flash_mla_available()
-        if requested_backend == "cudnn" and not flash_mla_available:
-            raise RuntimeError(
-                "FLEET_SLASHMLA_BACKEND=cudnn requires the FlashMLA sparse "
-                "forward kernel, but it is unavailable on this device."
-            )
-        use_fallback = use_fallback or (
-            requested_backend == "auto" and not flash_mla_available
-        )
-    except (ImportError, RuntimeError):
-        if requested_backend == "cudnn":
-            raise
-        if requested_backend == "auto":
-            raise ImportError(
-                "Unable to import cudnn_ops or function is not available."
-            )
-    if use_fallback:
-        raise ImportError("paddle backend is not available.")
-        latent_output = _paddle_sparse_attention(
-            query,
-            latent_key,
-            token_indices,
-            sm_scale,
-            int(kv_lora_rank),
-        )
-    else:
-        from paddlefleet.fusions.mqa_sparse_attn import mqa_sparse_attn
+    _require_slashmla_flash_mla()
 
-        latent_output = mqa_sparse_attn(
-            query,
-            latent_key,
-            token_indices,
-            float(sm_scale),
-            int(kv_lora_rank),
-            attn_sink=attn_sink,
-            use_slashmla=True,
-        )
+    from paddlefleet.fusions.mqa_sparse_attn import mqa_sparse_attn
+
+    latent_output = mqa_sparse_attn(
+        query,
+        latent_key,
+        token_indices,
+        float(sm_scale),
+        int(kv_lora_rank),
+        attn_sink=attn_sink,
+        use_slashmla=True,
+    )
     latent_output = latent_output.reshape(
         [query.shape[0], query.shape[1], query.shape[2], kv_lora_rank]
     )
@@ -1010,8 +639,20 @@ def slashmla_hca_sparse_attention(
     attn_sink=None,
     stage1_backend=None,
     fine_backend=None,
+    gate1=None,
+    gate2=None,
+    return_branches=False,
 ):
-    """Return ``O_hca + alpha * O_sparse`` over one shared MLA token KV."""
+    """Return gated HCA plus SparseMLA over one shared MLA token KV.
+
+    When ``gate1`` and ``gate2`` are provided, they are applied independently
+    to the HCA and SparseMLA branches before fusion:
+
+    ``sigmoid(gate1) * O_hca + alpha * sigmoid(gate2) * O_sparse``.
+
+    ``return_branches`` exposes the two branch outputs so callers that own the
+    gate projections can apply them without sharing one gate across branches.
+    """
     latent_key = shared_key.squeeze(2) if shared_key.ndim == 4 else shared_key
     if latent_key.ndim != 3:
         raise ValueError(
@@ -1044,9 +685,10 @@ def slashmla_hca_sparse_attention(
         mask,
         sm_scale,
         kv_lora_rank,
-        query_chunk_size=query_chunk_size,
     )
     hca_output = _deabsorb_value(hca_latent, value_weight, value_dim)
+    if gate1 is not None:
+        hca_output = hca_output * paddle.nn.functional.sigmoid(gate1)
     sparse_output = slashmla_sparse_attention(
         query,
         latent_key,
@@ -1057,5 +699,9 @@ def slashmla_hca_sparse_attention(
         value_dim,
         attn_sink=attn_sink,
     )
+    if gate2 is not None:
+        sparse_output = sparse_output * paddle.nn.functional.sigmoid(gate2)
+    if return_branches:
+        return hca_output, sparse_output, token_indices
     output = hca_output + float(alpha) * sparse_output
     return output, token_indices

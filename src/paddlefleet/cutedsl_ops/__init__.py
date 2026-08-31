@@ -10,6 +10,7 @@ from importlib.util import find_spec
 _LAZY_SYMBOLS = {
     "dsa_sparse_vha_score_cutedsl": ".two_stage_indexer",
     "dsa_sparse_vha_topk_two_stage_cutedsl": ".two_stage_indexer",
+    "hca_stage2_score_cutedsl": ".hca_stage2",
     "native_mla_cutedsl_fwd": ".native_mla_fwd",
     "flashmla_sm90_sparse_prefill": ".flashmla_sm90",
     "flashmla_sm90_sparse_prefill_wgmma": ".flashmla_sm90_wgmma",
@@ -19,6 +20,7 @@ __all__ = [
     "is_cutedsl_available",
     "dsa_sparse_vha_score_cutedsl",
     "dsa_sparse_vha_topk_two_stage_cutedsl",
+    "hca_stage2_score_cutedsl",
     "native_mla_cutedsl_fwd",
     "flashmla_sm90_sparse_prefill",
     "flashmla_sm90_sparse_prefill_wgmma",

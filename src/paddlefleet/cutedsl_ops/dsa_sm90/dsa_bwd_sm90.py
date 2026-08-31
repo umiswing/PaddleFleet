@@ -382,6 +382,17 @@ class _FlashAttentionDSABackwardPreprocessSm90:
 
             tOrO = cute.make_rmem_tensor_like(tOgO)
             tOrdO = cute.make_rmem_tensor_like(tOgdO)
+            # Predicated copies do not promise to initialize the destination
+            # lanes. Full query tiles with an aligned head dimension copy every
+            # lane, so clear only the non-aligned tail or padded head-dim lanes.
+            if cutlass.const_expr(self.check_hdim_oob):
+                tOrO.fill(0.0)
+                tOrdO.fill(0.0)
+            elif seqlen_q != seqlen_q_rounded and (
+                m_block == seqlen_q_rounded // self.m_block_size - 1
+            ):
+                tOrO.fill(0.0)
+                tOrdO.fill(0.0)
             assert cute.size(tOgO, mode=[0]) == cute.size(tOgdO, mode=[0])
             assert cute.size(tOgO, mode=[1]) == cute.size(tOgdO, mode=[1])
             assert cute.size(tOgO, mode=[2]) == cute.size(tOgdO, mode=[2])
@@ -433,20 +444,23 @@ class _FlashAttentionDSABackwardPreprocessSm90:
 
                     if cutlass.const_expr(mdSink is not None):
                         lse_row = gLSE[row] if row_valid else Float32.inf
-                        LOG2_E = math.log2(math.e)
-                        lse_log2 = lse_row * LOG2_E
-                        sink_log2 = mAttnSink[head_idx] * LOG2_E
-                        lse_max_log2 = cute.arch.fmax(lse_log2, sink_log2)
-                        sum_exp2 = Float32(
-                            cute.math.exp2(lse_log2 - lse_max_log2)
-                            + cute.math.exp2(sink_log2 - lse_max_log2)
-                        )
-                        lse_with_sink_log2 = lse_max_log2 + cute.math.log2(
-                            sum_exp2
-                        )
-                        p_sink = cute.math.exp2(sink_log2 - lse_with_sink_log2)
                         if lse_row == Float32.inf:
                             p_sink = Float32(0.0)
+                        else:
+                            LOG2_E = math.log2(math.e)
+                            lse_log2 = lse_row * LOG2_E
+                            sink_log2 = mAttnSink[head_idx] * LOG2_E
+                            lse_max_log2 = cute.arch.fmax(lse_log2, sink_log2)
+                            sum_exp2 = Float32(
+                                cute.math.exp2(lse_log2 - lse_max_log2)
+                                + cute.math.exp2(sink_log2 - lse_max_log2)
+                            )
+                            lse_with_sink_log2 = lse_max_log2 + cute.math.log2(
+                                sum_exp2
+                            )
+                            p_sink = cute.math.exp2(
+                                sink_log2 - lse_with_sink_log2
+                            )
                         if row_valid:
                             atomic_add_fp32(
                                 -p_sink * dP_sum[m],
@@ -500,17 +514,23 @@ class _FlashAttentionDSABackwardPreprocessSm90:
                 )
                 LOG2_E = math.log2(math.e)
                 if tidx < seqlen_q_rounded - m_block * self.m_block_size:
-                    lse_log2 = lse * LOG2_E if lse != -Float32.inf else 0.0
-                    if cutlass.const_expr(mAttnSink is not None):
-                        sink_log2 = mAttnSink[head_idx] * LOG2_E
-                        lse_max_log2 = cute.arch.fmax(lse_log2, sink_log2)
-                        sum_exp2 = Float32(
-                            cute.math.exp2(lse_log2 - lse_max_log2)
-                            + cute.math.exp2(sink_log2 - lse_max_log2)
-                        )
-                        lse_log2 = lse_max_log2 + cute.math.log2(sum_exp2)
-                        if lse == Float32.inf:
-                            lse_log2 = Float32.inf
+                    lse_log2 = Float32(0.0)
+                    if lse == Float32.inf:
+                        # Padding rows are represented by +inf here.  Do not
+                        # evaluate inf-inf in the sink-aware logaddexp path:
+                        # that creates a transient NaN before the value is
+                        # overwritten with +inf.
+                        lse_log2 = Float32.inf
+                    else:
+                        lse_log2 = lse * LOG2_E if lse != -Float32.inf else 0.0
+                        if cutlass.const_expr(mAttnSink is not None):
+                            sink_log2 = mAttnSink[head_idx] * LOG2_E
+                            lse_max_log2 = cute.arch.fmax(lse_log2, sink_log2)
+                            sum_exp2 = Float32(
+                                cute.math.exp2(lse_log2 - lse_max_log2)
+                                + cute.math.exp2(sink_log2 - lse_max_log2)
+                            )
+                            lse_log2 = lse_max_log2 + cute.math.log2(sum_exp2)
                     gLSElog2[tidx] = lse_log2
 
 
@@ -1492,6 +1512,8 @@ class FlashAttentionDSABackwardSm90:
                 self._wg0_one_n_block(
                     n_block,
                     wg_tidx,
+                    tiled_mma_SdP,
+                    topK,
                     mKV_cur,
                     mTopkIdxs_cur,
                     sKV,
@@ -1521,6 +1543,8 @@ class FlashAttentionDSABackwardSm90:
                     self._wg0_one_n_block(
                         n_block,
                         wg_tidx,
+                        tiled_mma_SdP,
+                        topK,
                         mKV_cur,
                         mTopkIdxs_cur,
                         sKV,
@@ -1693,6 +1717,8 @@ class FlashAttentionDSABackwardSm90:
         self,
         n_block: Int32,
         wg_tidx: Int32,
+        tiled_mma_SdP: cute.TiledMma,
+        topK: Int32,
         mKV_cur: cute.Tensor,  # (s_kv, headdim) gmem
         mTopkIdxs_cur: cute.Tensor,  # (topk,) gmem
         sKV: cute.Tensor,  # (tile_n, headdim) swizzled smem
@@ -1779,16 +1805,47 @@ class FlashAttentionDSABackwardSm90:
         # (2) GEMM2: dP = dO @ KV^T
         acc_dP = mma_dov_fn(B_idx=None, wg_wait=1)
 
+        # Map each accumulator element back to its top-k slot.  The KV gather
+        # zero-fills invalid token ids, but a zero KV row is not a softmax mask:
+        # its QK score is still zero and would otherwise receive probability.
+        # Keep the mask in the register-domain S tensor so both P and dS see
+        # exactly the same support, including interior -1 entries.
+        wg_mma_SdP = tiled_mma_SdP.get_slice(wg_tidx)
+        topk_shape = (
+            (self.tile_m, self.tile_n)
+            if const_expr(not self.SdP_swapAB)
+            else (self.tile_n, self.tile_m)
+        )
+        cTopk = cute.make_identity_tensor(topk_shape)
+        tScTopk_mn = make_acc_tensor_mn_view(
+            wg_mma_SdP.partition_C(cTopk), transpose=self.SdP_swapAB
+        )
+
         # (3) Softmax: P = exp2(S * scale_log2 - LSE)
         acc_S_mn = make_acc_tensor_mn_view(acc_S, transpose=self.SdP_swapAB)
         for r in cutlass.range_constexpr(cute.size(acc_S_mn, mode=[0])):
             for c in cutlass.range(
                 cute.size(acc_S_mn, mode=[1]), unroll_full=True
             ):
-                acc_S_mn[r, c] = cute.math.exp2(
-                    acc_S_mn[r, c] * softmax_scale_log2 - tLSErLSE[r],
-                    fastmath=True,
-                )
+                topk_col = tScTopk_mn[r, c][1]
+                global_topk_row = n_block * self.tile_n + topk_col
+                if global_topk_row < topK:
+                    if mTopkIdxs_cur[global_topk_row] >= 0:
+                        if tLSErLSE[r] != -Float32.inf:
+                            acc_S_mn[r, c] = cute.math.exp2(
+                                acc_S_mn[r, c] * softmax_scale_log2
+                                - tLSErLSE[r],
+                                fastmath=True,
+                            )
+                        else:
+                            # Avoid -inf-(-inf) for an empty sparse row.
+                            acc_S_mn[r, c] = 0.0
+                    else:
+                        # Zero-filled KV is not itself a softmax mask.
+                        acc_S_mn[r, c] = 0.0
+                else:
+                    # The first n-block can contain top-k tail rows.
+                    acc_S_mn[r, c] = 0.0
 
         # Convert P f32 -> bf16
         tdKVrP = cvt_f16(make_acc_tensor_frgA_view(acc_S), self.dtype)

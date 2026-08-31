@@ -604,16 +604,6 @@ class MultiLatentAttention(Attention):
                 tp_comm_buffer_name="mla_gate",
                 tp_group=self.pg_collection.tp,
             )
-            print(
-                f"[GatedAttnCheck][init] layer={getattr(self, 'layer_number', -1)} "
-                f"gated_attention={self.gated_attention} "
-                f"gated_attn_use_q_lora={self.gated_attn_use_q_lora} "
-                f"q_lora_rank={self.q_lora_rank} "
-                f"hidden_size={self.config.hidden_size} "
-                f"gate_in_dim={gate_in_dim} "
-                f"gate_out_dim={self.out_projection_size}",
-                flush=True,
-            )
         else:
             self.gated_attention = False
             self.gate_proj = None
@@ -2479,21 +2469,27 @@ class MQASelfAttention(MLASelfAttention):
         value_weight = v_absorb_weight.transpose([1, 0, 2])
 
         if self.use_slashmla_hca:
-            sparse_core_attn_out, _ = slashmla_hca_sparse_attention(
-                query,
-                shared_key,
-                value_weight,
-                self.slashmla_hca_compressor,
-                self.config.slashmla_topk,
-                self.config.slashmla_dim,
-                self.config.slashmla_hca_block_topk,
-                self.softmax_scale,
-                kv_lora_rank,
-                self.v_head_dim,
-                mask=attn_mask_startend_row_indices,
-                alpha=self.config.slashmla_hca_alpha,
-                query_chunk_size=self.config.slashmla_hca_query_chunk_size,
-                attn_sink=getattr(self, "sparse_attn_sink", None),
+            hca_core_attn_out, sparse_core_attn_out, _ = (
+                slashmla_hca_sparse_attention(
+                    query,
+                    shared_key,
+                    value_weight,
+                    self.slashmla_hca_compressor,
+                    self.config.slashmla_topk,
+                    self.config.slashmla_dim,
+                    self.config.slashmla_hca_block_topk,
+                    self.softmax_scale,
+                    kv_lora_rank,
+                    self.v_head_dim,
+                    mask=attn_mask_startend_row_indices,
+                    alpha=self.config.slashmla_hca_alpha,
+                    # The stable 8K HCA path scores the whole query sequence in
+                    # one chunk.  Keep this tied to the actual sequence length
+                    # so the same path extends naturally to other scales.
+                    query_chunk_size=int(query.shape[1]),
+                    attn_sink=getattr(self, "sparse_attn_sink", None),
+                    return_branches=True,
+                )
             )
         else:
             latent_key = (
@@ -2517,29 +2513,89 @@ class MQASelfAttention(MLASelfAttention):
                 attn_sink=getattr(self, "sparse_attn_sink", None),
             )
 
+        # Apply postmix before the branch gates. HCA mode has two independent
+        # branches; plain SlashMLA has only the SparseMLA branch.
         if self.use_vha_postmix:
-            if (
-                self.recompute_vha_postmix
-                and self.training
-                and not in_recompute
-            ):
-                sparse_core_attn_out = recompute(
-                    self._apply_vha_postmix, sparse_core_attn_out
-                )
+            if self.use_slashmla_hca:
+                if (
+                    self.recompute_vha_postmix
+                    and self.training
+                    and not in_recompute
+                ):
+                    hca_core_attn_out = recompute(
+                        self._apply_vha_postmix,
+                        hca_core_attn_out,
+                        self.vha_postmix_U,
+                        self.vha_postmix_V,
+                    )
+                    sparse_core_attn_out = recompute(
+                        self._apply_vha_postmix,
+                        sparse_core_attn_out,
+                        self.sparse_vha_postmix_U,
+                        self.sparse_vha_postmix_V,
+                    )
+                else:
+                    hca_core_attn_out = self._apply_vha_postmix(
+                        hca_core_attn_out,
+                        self.vha_postmix_U,
+                        self.vha_postmix_V,
+                    )
+                    sparse_core_attn_out = self._apply_vha_postmix(
+                        sparse_core_attn_out,
+                        self.sparse_vha_postmix_U,
+                        self.sparse_vha_postmix_V,
+                    )
             else:
-                sparse_core_attn_out = self._apply_vha_postmix(
-                    sparse_core_attn_out
-                )
+                if (
+                    self.recompute_vha_postmix
+                    and self.training
+                    and not in_recompute
+                ):
+                    sparse_core_attn_out = recompute(
+                        self._apply_vha_postmix,
+                        sparse_core_attn_out,
+                        self.sparse_vha_postmix_U,
+                        self.sparse_vha_postmix_V,
+                    )
+                else:
+                    sparse_core_attn_out = self._apply_vha_postmix(
+                        sparse_core_attn_out,
+                        self.sparse_vha_postmix_U,
+                        self.sparse_vha_postmix_V,
+                    )
 
         if self.gated_attention:
             gate_source = (
                 q_compressed if self.gated_attn_use_q_lora else hidden_states
             )
-            sparse_core_attn_out = self._gate(gate_source, sparse_core_attn_out)
+            if self.use_slashmla_hca:
+                hca_core_attn_out = self._gate_with_projection(
+                    gate_source, hca_core_attn_out, self.gate_proj
+                )
+                sparse_core_attn_out = self._gate_with_projection(
+                    gate_source, sparse_core_attn_out, self.sparse_gate_proj
+                )
+            else:
+                sparse_core_attn_out = self._gate_with_projection(
+                    gate_source, sparse_core_attn_out, self.gate_proj
+                )
 
+        if self.use_slashmla_hca:
+            sparse_core_attn_out = hca_core_attn_out + (
+                float(self.config.slashmla_hca_alpha) * sparse_core_attn_out
+            )
         output, bias = self.o_proj(sparse_core_attn_out)
         TransformerLayer._log_md5(output, "attn_o_proj_out", layer_num)
         return output, bias
+
+    def _gate_with_projection(self, gate_source, attn_out, gate_proj):
+        """Apply one independent gated-attention projection."""
+        gate, _ = gate_proj(gate_source)
+        if self.config.sigmoid_gate_fusion:
+            from paddlefleet.triton_ops import SigmoidGateFusionTriton
+
+            return SigmoidGateFusionTriton.apply(attn_out, gate)
+        return attn_out * paddle.nn.functional.sigmoid(gate)
 
     def forward(
         self,

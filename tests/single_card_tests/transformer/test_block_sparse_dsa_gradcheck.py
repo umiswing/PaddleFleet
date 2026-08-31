@@ -55,6 +55,21 @@ DV = 512  # value width == leading 512 dims of the shared latent
 SM = DK**-0.5
 
 
+def _sm90_available():
+    if not paddle.is_compiled_with_cuda():
+        return False
+    try:
+        paddle.set_device("gpu")
+        return paddle.device.cuda.get_device_capability()[0] == 9
+    except Exception:
+        return False
+
+
+_SM90 = unittest.skipUnless(
+    _sm90_available(), "requires an SM90 GPU for CuTeDSL backward"
+)
+
+
 # ---------------------------------------------------------------------------
 # Input construction
 # ---------------------------------------------------------------------------
@@ -85,7 +100,14 @@ def _to_bf16(arr):
     return paddle.to_tensor(arr).cast("bfloat16")
 
 
-def _kernel_forward(q_np, kv_np, ti_np, sink=None, sink_dtype="float32"):
+def _kernel_forward(
+    q_np,
+    kv_np,
+    ti_np,
+    sink=None,
+    sink_dtype="float32",
+    use_slashmla=False,
+):
     """Run the PyLayer forward. Returns (out_fp32 [s, H*DV], handles).
 
     ``handles`` are the leaf bf16 q/kv (+ fp32/bf16 sink) with grad enabled so
@@ -100,7 +122,15 @@ def _kernel_forward(q_np, kv_np, ti_np, sink=None, sink_dtype="float32"):
         sink_t = paddle.to_tensor(np.asarray(sink, "float32")).cast(sink_dtype)
         sink_t.stop_gradient = False
     ti = paddle.to_tensor(ti_np)
-    out = mqa_sparse_attn(qb, kvb, ti, float(SM), DV, sink_t)
+    out = mqa_sparse_attn(
+        qb,
+        kvb,
+        ti,
+        float(SM),
+        DV,
+        sink_t,
+        use_slashmla=use_slashmla,
+    )
     return out, (qb, kvb, sink_t)
 
 
@@ -209,12 +239,23 @@ def _analytic_ref_grads(q_np, kv_np, ti_np, dO_np, sink_mag=None):
 
 
 def _kernel_grads(
-    q_np, kv_np, ti_np, dO_np, sink_mag=None, sink_dtype="float32"
+    q_np,
+    kv_np,
+    ti_np,
+    dO_np,
+    sink_mag=None,
+    sink_dtype="float32",
+    use_slashmla=False,
 ):
     """dQ / dKV / d_sink from the PyLayer backward (bf16 kernel)."""
     sink = None if sink_mag is None else [sink_mag] * q_np.shape[2]
     out, (qb, kvb, sink_t) = _kernel_forward(
-        q_np, kv_np, ti_np, sink, sink_dtype
+        q_np,
+        kv_np,
+        ti_np,
+        sink,
+        sink_dtype,
+        use_slashmla=use_slashmla,
     )
     dO = paddle.to_tensor(dO_np.reshape(out.shape))
     (out.cast("float32") * dO).sum().backward()
@@ -294,6 +335,11 @@ class _Base(unittest.TestCase):
             paddle.set_flags({"FLAGS_cudnn_deterministic": True})
         except Exception:
             pass
+
+    def require_sm90(self):
+        major, _ = paddle.device.cuda.get_device_capability()
+        if major != 9:
+            self.skipTest("SM90 CuTeDSL backward test")
 
 
 # ===========================================================================
@@ -623,7 +669,51 @@ class TestIndexEdgeCases(_Base):
 
 
 # ===========================================================================
-# 7. dtype behaviour
+# 7. SM90 CuTeDSL backward edge cases
+# ===========================================================================
+@_SM90
+class TestCuTeDSLBackwardEdgeCases(_Base):
+    """Exercise the local SM90 path where invalid slots are easy to mishandle."""
+
+    def test_empty_row_and_non_aligned_query_are_finite(self):
+        self.require_sm90()
+        H, s = 8, 65
+        q = _rand([1, s, H, DK], 0.3, 151)
+        kv = _rand([1, s, DK], 0.3, 152)
+        ti = np.full([1, s, 128], -1, np.int32)
+        for row in range(s):
+            ti[0, row, 0] = row
+        ti[0, 17, :] = -1
+        dO = _rand([1, s, H * DV], 1.0, 153)
+
+        dq, dkv, _ = _kernel_grads(q, kv, ti, dO, use_slashmla=True)
+        self.assertTrue(np.isfinite(dq).all())
+        self.assertTrue(np.isfinite(dkv).all())
+        self.assertEqual(float(np.abs(dq[17]).max()), 0.0)
+
+    def test_interior_invalid_slot_is_masked_in_backward(self):
+        self.require_sm90()
+        H, s = 8, 8
+        q = _rand([1, s, H, DK], 0.3, 161)
+        kv = _rand([1, s, DK], 0.3, 162)
+        ti = np.full([1, s, 128], -1, np.int32)
+        for row in range(7):
+            ti[0, row, 0] = row
+        ti[0, 7, :5] = [0, 1, -1, 3, 4]
+        dO = _rand([1, s, H * DV], 1.0, 163)
+
+        (kq, kkv, _), (rq, rkv, _) = (
+            _kernel_grads(q, kv, ti, dO, use_slashmla=True),
+            _analytic_ref_grads(q, kv, ti, dO),
+        )
+        self.assertTrue(np.isfinite(kq).all())
+        self.assertTrue(np.isfinite(kkv).all())
+        self.assertLess(_relerr(kq, rq), 2e-2)
+        self.assertLess(_relerr(kkv, rkv), 2e-2)
+
+
+# ===========================================================================
+# 8. dtype behaviour
 # ===========================================================================
 @_GPU
 class TestDtypeBehaviour(_Base):
@@ -666,7 +756,7 @@ class TestDtypeBehaviour(_Base):
 
 
 # ===========================================================================
-# 8. Determinism
+# 9. Determinism
 # ===========================================================================
 @_GPU
 class TestDeterminism(_Base):

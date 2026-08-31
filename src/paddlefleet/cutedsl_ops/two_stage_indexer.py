@@ -31,8 +31,15 @@ This module intentionally contains no SM100/Blackwell implementation.
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Final
+from typing import Final
 
+# ``cuda`` must be a real module-level binding, not a TYPE_CHECKING-only one:
+# this file uses ``from __future__ import annotations``, so the kernel entry
+# points' ``stream: cuda.CUstream`` annotations are strings that CuTeDSL
+# resolves with ``inspect.signature(..., eval_str=True)`` at ``cute.compile``
+# time. Behind TYPE_CHECKING that lookup raises ``NameError: name 'cuda' is
+# not defined`` and every kernel in this module becomes uncompilable.
+import cuda.bindings.driver as cuda  # noqa: TC002
 import cutlass
 import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass import BFloat16, Float32, Int32, Uint16, Uint32, cute
@@ -51,9 +58,6 @@ from cutlass.utils.distributed import atomicAdd
 
 from .dlpack import paddle_to_cute_tensor
 from .exact_radix import ExactRadixSelector, fp32_to_sortable_uint32
-
-if TYPE_CHECKING:
-    import cuda.bindings.driver as cuda
 
 _THREADS: Final = 256
 _BUCKET_8K: Final = 8192

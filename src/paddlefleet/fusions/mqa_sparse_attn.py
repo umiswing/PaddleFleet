@@ -25,6 +25,8 @@ Always uses FlashMLA sparse forward.  The backward is selected by
     identical inputs.  That does not depend on ``FLAGS_cudnn_deterministic``:
     it always runs the atomic-free kernel, unlike the symmetric
     ``sparse_mqa_bwd``, which reads that flag to pick one.
+SlashMLA instead selects the local CuTeDSL DSA backward
+    ``csa_sparse_attn_bwd_cutedsl`` on SM90 (that kerne
 
 The forward cannot be tilelang because ``sparse_mqa_fwd`` asserts
 ``dim == next_power_of_2(dim)`` and ``d_qk = 576`` is not a power of two.
@@ -335,17 +337,19 @@ class _MQASparseAttention(paddle.autograd.PyLayer):
                 sink_bwd = paddle.full([hpad], _NEG_SINK, dtype="float32")
             lse_flat = lse_bwd.reshape([b * s, hpad])
 
-            # SM90's DSA backward kernel drops its ``-1`` guard when a
-            # topk_length bound is supplied.  The forward-side adapter has already
-            # compacted rows with interior holes; on SM90 it also disables this
-            # bound if a row is completely empty.  SM100 keeps the upstream guard
-            # and can use the bound in either representation.
-            topk_length_bwd = (
-                topk_len_flat
-                if (ctx.topk_length_safe or _csa_bwd_honours_topk_length_holes())
-                else None
-            )
-            if ctx.use_slashmla:
+        # SM90's DSA backward kernel drops its ``-1`` guard when a
+        # topk_length bound is supplied.  The forward-side adapter has already
+        # compacted rows with interior holes; on SM90 it also disables this
+        # bound if a row is completely empty.  SM100 keeps the upstream guard
+        # and can use the bound in either representation.
+        topk_length_bwd = (
+            topk_len_flat
+            if (ctx.topk_length_safe or _csa_bwd_honours_topk_length_holes())
+            else None
+        )
+        if ctx.use_slashmla:
+            major = paddle.device.cuda.get_device_capability()[0]
+            if major == 9:
                 from paddlefleet.cudnn_ops import csa_sparse_attn_bwd_cutedsl
 
                 dq_flat, dkv_flat, _d_sink_unused = csa_sparse_attn_bwd_cutedsl(
@@ -363,8 +367,28 @@ class _MQASparseAttention(paddle.autograd.PyLayer):
                     # sinkless SlashMLA path.
                     need_d_sink=False,
                 )
-            else:
+            elif major >= 10:
                 from paddlefleet.cudnn_ops import csa_sparse_attn_bwd_cudnn
+
+                dq_flat, dkv_flat, _d_sink_unused = csa_sparse_attn_bwd_cudnn(
+                    q_flat,
+                    kv_flat,
+                    o_flat,
+                    do_flat,
+                    lse_flat,
+                    sink_bwd,
+                    gidx_flat,
+                    softmax_scale=ctx.sm_scale,
+                    topk_length=topk_length_bwd,
+                )
+            else:
+                raise RuntimeError(
+                    "SlashMLA sparse attention requires SM90 (local CuTeDSL "
+                    "DSA backward) or SM100+ (cuDNN DSA backward); got compute "
+                    f"capability major {major}."
+                )
+        else:
+            from paddlefleet.cudnn_ops import csa_sparse_attn_bwd_cudnn
 
 
             # DSA passes topk_length=None (the guarded, full-width backward path)

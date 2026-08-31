@@ -576,6 +576,7 @@ def get_gpt_layer_local_spec(
                 "(or attention_layer_type='multi_latent_attention'). HySparse "
                 "is not supported with standard self-attention."
             )
+    if config is not None and config.enable_hy_sparse_attention:
         # HySparseTransformerLayer does not implement the hyper-connection or
         # block-attention-residual dataflows. Overriding transformer_cls here
         # would silently drop those layers instead of applying them, so reject

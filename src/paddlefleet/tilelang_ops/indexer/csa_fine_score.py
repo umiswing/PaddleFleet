@@ -73,6 +73,15 @@ if HAS_TILELANG:
         query_offset_shape = [1]
         group_count = block_topk + 1
         num_tiles = ratio // block_tile
+        # ``duplicate_flags`` is reduced with ``T.reduce_sum`` over a fragment of
+        # ``block_topk`` lanes. TileLang's layout inference only produces a
+        # consistent replicate extent for that reduction when the fragment
+        # length is a power of two -- with e.g. block_topk=31 it derives a
+        # source extent of 126 against a 128-lane destination and the
+        # ReduceOp lowering aborts. Pad the fragment to the next power of two
+        # and keep the tail at zero; the sum, and therefore the duplicate test,
+        # is unchanged.
+        duplicate_len = 1 << max(int(block_topk) - 1, 0).bit_length()
         score_shape = [batch, seq_len, group_count, num_tiles, block_tile]
         index_shape = [batch, seq_len, group_count, num_tiles, block_tile]
 
@@ -94,7 +103,7 @@ if HAS_TILELANG:
                 products = T.alloc_fragment([block_tile, dim], "float")
                 tile_scores = T.alloc_fragment([block_tile], "float")
                 tile_ids = T.alloc_fragment([block_tile], "int32")
-                duplicate_flags = T.alloc_fragment([block_topk], "float")
+                duplicate_flags = T.alloc_fragment([duplicate_len], "float")
                 duplicate_sum = T.alloc_fragment([1], "float")
                 tile_scores_shared = T.alloc_shared([block_tile], "float")
                 tile_ids_shared = T.alloc_shared([block_tile], "int32")
@@ -111,12 +120,16 @@ if HAS_TILELANG:
                 current_start = (
                     valid_start + ((query_pos - valid_start) // ratio) * ratio
                 )
-                for block_i in T.Parallel(block_topk):
-                    block_id = SelectedBlocks[by, bx, block_i]
+                for block_i in T.Parallel(duplicate_len):
+                    block_id = SelectedBlocks[
+                        by, bx, T.min(block_i, block_topk - 1)
+                    ]
                     safe_block_id = T.max(block_id, 0)
                     selected_start = BlockStarts[by, safe_block_id]
                     duplicate_flags[block_i] = T.if_then_else(
-                        (block_id >= 0) & (selected_start == current_start),
+                        (block_i < block_topk)
+                        & (block_id >= 0)
+                        & (selected_start == current_start),
                         T.cast(1, "float"),
                         T.cast(0, "float"),
                     )
